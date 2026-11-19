@@ -1,0 +1,28 @@
+[package]
+name = "dbmr-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "dbmr-bench"
+path = "src/main.rs"
+
+[dependencies]
+dbmr-core.workspace = true
+dbmr-adapters = { workspace = true, features = ["sqlite", "postgres"] }
+tokio = { workspace = true, features = ["full"] }
+sqlx = { workspace = true, features = ["sqlite", "postgres"] }
+indexmap.workspace = true
+compact_str.workspace = true
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+rand = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

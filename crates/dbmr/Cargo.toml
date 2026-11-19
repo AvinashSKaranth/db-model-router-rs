@@ -1,0 +1,49 @@
+[package]
+name = "dbmr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Database-agnostic data modeling and custom routers for Rust web services"
+readme = "README.md"
+repository = "https://github.com/eForge/db-model-router-rs"
+keywords = ["orm", "database", "router", "axum", "rest"]
+categories = ["web-programming::http-server", "database"]
+
+
+[features]
+default = ["sqlite"]
+sqlite = ["dbmr-adapters/sqlite"]
+postgres = ["dbmr-adapters/postgres"]
+mysql = ["dbmr-adapters/mysql"]
+mariadb = ["dbmr-adapters/mariadb"]
+mssql = ["dbmr-adapters/mssql"]
+oracle = ["dbmr-adapters/oracle"]
+cockroachdb = ["dbmr-adapters/cockroachdb"]
+mongodb = ["dbmr-adapters/mongodb"]
+redis = ["dbmr-adapters/redis"]
+dynamodb = ["dbmr-adapters/dynamodb"]
+kafka = ["dep:dbmr-kafka"]
+testing = []
+
+[dependencies]
+dbmr-core.workspace = true
+dbmr-schema.workspace = true
+dbmr-adapters.workspace = true
+dbmr-http.workspace = true
+tokio.workspace = true
+indexmap.workspace = true
+dbmr-kafka = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+tower.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
+serde_json.workspace = true
+indexmap.workspace = true
+
+[lints]
+workspace = true

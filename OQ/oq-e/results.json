@@ -1,0 +1,86 @@
+{
+ "summary": {
+  "mode": "reference",
+  "context": [
+   "AGENTS.md",
+   "README.md",
+   "crates/dbmr/examples/quickstart.rs"
+  ],
+  "score_pct": 100.0,
+  "green": 5,
+  "runs": 5,
+  "first_attempt_compile_rate": 1.0
+ },
+ "results": [
+  {
+   "task": "E1",
+   "run": 1,
+   "attempts": [
+    {
+     "attempt": 1,
+     "compiled": true,
+     "green": true,
+     "tail": ""
+    }
+   ],
+   "green": true,
+   "score": 10
+  },
+  {
+   "task": "E2",
+   "run": 1,
+   "attempts": [
+    {
+     "attempt": 1,
+     "compiled": true,
+     "green": true,
+     "tail": ""
+    }
+   ],
+   "green": true,
+   "score": 10
+  },
+  {
+   "task": "E3",
+   "run": 1,
+   "attempts": [
+    {
+     "attempt": 1,
+     "compiled": true,
+     "green": true,
+     "tail": ""
+    }
+   ],
+   "green": true,
+   "score": 10
+  },
+  {
+   "task": "E4",
+   "run": 1,
+   "attempts": [
+    {
+     "attempt": 1,
+     "compiled": true,
+     "green": true,
+     "tail": ""
+    }
+   ],
+   "green": true,
+   "score": 10
+  },
+  {
+   "task": "E5",
+   "run": 1,
+   "attempts": [
+    {
+     "attempt": 1,
+     "compiled": true,
+     "green": true,
+     "tail": ""
+    }
+   ],
+   "green": true,
+   "score": 10
+  }
+ ]
+}

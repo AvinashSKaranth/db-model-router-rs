@@ -1,0 +1,30 @@
+[package]
+name = "dbmr-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+dbmr-core.workspace = true
+compact_str.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+dbmr-adapters = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["macros"] }
+indexmap.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
+
+[lints]
+workspace = true

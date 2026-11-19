@@ -1,0 +1,21 @@
+# dbmr
+
+> Rust library: database-agnostic models (validation, hooks, row-level scopes, soft delete, encryption, transactions) and generated Axum REST routers with Node db-model-router parity. Library only; no CLI or migrations. Permissions come from app middleware that inserts a `Scope` request extension; the model enforces it.
+
+## Start here
+- [AGENTS.md](AGENTS.md): exact rules and pitfalls for generating code against dbmr
+- [skills/dbmr/SKILL.md](skills/dbmr/SKILL.md): full agent skill (model, HTTP, adapters, recipes)
+- [skills/dbmr/references/examples.md](skills/dbmr/references/examples.md): worked examples for every feature
+- [README.md](README.md): adapter status, Model API, scope, HTTP contract, query parameters
+- [crates/dbmr/examples/quickstart.rs](crates/dbmr/examples/quickstart.rs): compiled minimal app (auth middleware with Scope, require_scope, hooks, soft delete)
+
+## Reference
+- [crates/dbmr/examples/tour.rs](crates/dbmr/examples/tour.rs): every feature in one runnable file with asserts
+- [crates/dbmr-http/tests/scope_tests.rs](crates/dbmr-http/tests/scope_tests.rs): scope enforcement on every operation
+- [crates/dbmr-http/tests/route_tests.rs](crates/dbmr-http/tests/route_tests.rs): every HTTP status and body, as executable tests
+- [crates/dbmr/tests/model_contract.rs](crates/dbmr/tests/model_contract.rs): model-level contract (upsert, transactions, events, encryption)
+- [docs/deviations.md](docs/deviations.md): where behaviour differs from Node
+
+## Optional
+- [docs/adr/README.md](docs/adr/README.md): architecture decisions
+- [OQ/README.md](OQ/README.md): qualification plan and evidence

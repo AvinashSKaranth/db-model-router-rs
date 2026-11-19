@@ -1,0 +1,13 @@
+# gitleaks config: default rules, minus build output and local tooling caches.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "build output, caches, generated reports"
+paths = [
+  '''(^|[\/])target[\/]''',
+  '''(^|[\/])\.codegraph[\/]''',
+  '''(^|[\/])node_modules[\/]''',
+  '''docs[\/]report(-history)?\.(html|json)$''',
+  '''(^|[\/])Cargo\.lock$''',
+]
