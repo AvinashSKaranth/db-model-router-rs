@@ -1,29 +1,42 @@
 //! Minimal dbmr service: one model, hooks, a tenant-scoped REST router.
 //!
 //! Smoke run (no server):  cargo run -p dbmr --example quickstart
-//! Serve on :3000:         cargo run -p dbmr --example quickstart -- --serve
+//! Serve on :3000:         set DBMR_DEMO_TOKEN_A and DBMR_DEMO_TOKEN_B, then pass --serve
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::extract::State;
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::Router;
 use dbmr::adapters::SqliteAdapter;
-use dbmr::{create_model_router, CurrentUser, DbValue, Model, ModelHooks, Scope};
+use dbmr::http::{create_model_router_with, RouterOptions};
+use dbmr::{AppError, CurrentUser, DbValue, Model, ModelHooks, Scope};
 use serde_json::json;
+use std::sync::Arc;
 use tower::ServiceExt;
 
-/// Auth stub: real apps verify a session or token here. `CurrentUser` reaches hooks as
-/// `ctx.user`; `Scope` limits every read and write of the request to the tenant's rows.
-async fn auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    let tenant = req
+/// The demo maps server-configured bearer credentials to tenant membership.
+type DemoTokens = Arc<[String; 2]>;
+
+async fn auth(
+    State(tokens): State<DemoTokens>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let token = req
         .headers()
-        .get("x-tenant")
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?
-        .to_string();
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let tenant = tokens
+        .iter()
+        .position(|expected| expected == token)
+        .map(|i| ["a", "b"][i])
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     req.extensions_mut()
         .insert(CurrentUser(json!({ "tenant_id": tenant })));
     req.extensions_mut()
@@ -33,6 +46,23 @@ async fn auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
 
 #[tokio::main]
 async fn main() -> dbmr::Result<()> {
+    let serve = std::env::args().any(|a| a == "--serve");
+    let tokens = if serve {
+        let token = |name| {
+            std::env::var(name)
+                .map_err(|_| AppError::Validation(format!("Set {name} to a secret bearer token.")))
+        };
+        let a = token("DBMR_DEMO_TOKEN_A")?;
+        let b = token("DBMR_DEMO_TOKEN_B")?;
+        if a.len() < 32 || b.len() < 32 || a == b {
+            return Err(AppError::Validation(
+                "Use distinct demo tokens of at least 32 characters.".into(),
+            ));
+        }
+        Arc::new([a, b])
+    } else {
+        Arc::new(["fixture-a".into(), "fixture-b".into()])
+    };
     // 1. Adapter. Applications own DDL; dbmr never creates tables.
     let db = SqliteAdapter::connect("sqlite::memory:").await?;
     dbmr::DatabaseAdapter::query(
@@ -44,6 +74,12 @@ async fn main() -> dbmr::Result<()> {
             body TEXT,
             is_deleted INTEGER NOT NULL DEFAULT 0
         )",
+        &[],
+    )
+    .await?;
+    dbmr::DatabaseAdapter::query(
+        db.as_ref(),
+        "CREATE INDEX notes_tenant_visible ON notes (tenant_id, is_deleted, id)",
         &[],
     )
     .await?;
@@ -69,11 +105,16 @@ async fn main() -> dbmr::Result<()> {
 
     // 3. Router. The model applies the request's Scope to every read filter and write,
     //    so clients cannot cross tenants whatever they send.
+    let options = RouterOptions {
+        create: true,
+        export: false,
+        ..RouterOptions::read_only()
+    };
     let app = Router::new()
-        .nest("/notes", create_model_router(notes))
-        .layer(middleware::from_fn(auth));
+        .nest("/notes", create_model_router_with(notes, options))
+        .layer(middleware::from_fn_with_state(tokens.clone(), auth));
 
-    if std::env::args().any(|a| a == "--serve") {
+    if serve {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
             .await
             .expect("bind :3000");
@@ -82,11 +123,11 @@ async fn main() -> dbmr::Result<()> {
     }
 
     // Smoke run: create as tenant A, then list as A and as B.
-    let send = |method: &str, uri: &str, tenant: &str, body: Option<serde_json::Value>| {
+    let send = |method: &str, uri: &str, token: &str, body: Option<serde_json::Value>| {
         Request::builder()
             .method(method)
             .uri(uri)
-            .header("x-tenant", tenant)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
             .unwrap()
@@ -96,24 +137,24 @@ async fn main() -> dbmr::Result<()> {
         .oneshot(send(
             "POST",
             "/notes",
-            "a",
+            &tokens[0],
             Some(json!({ "title": "  hello  " })),
         ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    for (tenant, expected) in [("a", 1), ("b", 0)] {
+    for (i, expected) in [1, 0].into_iter().enumerate() {
         let res = app
             .clone()
-            .oneshot(send("GET", "/notes", tenant, None))
+            .oneshot(send("GET", "/notes", &tokens[i], None))
             .await
             .unwrap();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
         let page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(page["count"], expected, "tenant {tenant}: {page}");
-        println!("tenant {tenant}: {page}");
+        assert_eq!(page["count"], expected, "tenant {i}: {page}");
+        println!("tenant {i}: {page}");
     }
     Ok(())
 }

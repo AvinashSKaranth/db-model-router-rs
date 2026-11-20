@@ -10,7 +10,7 @@ use axum::response::Response;
 use axum::Router;
 use dbmr::adapters::SqliteAdapter;
 use dbmr::core::types::json_to_row;
-use dbmr::core::{Context, Model, ModelBuilder, Query, Scope};
+use dbmr::core::{Context, Model, ModelBuilder, ModelHooks, Query, Scope};
 use dbmr::http::create_model_router;
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -116,6 +116,27 @@ async fn b_rows(m: &Model) -> Vec<Value> {
     let ctx = Context::new().with_scope([("tenant_id", "b")]);
     let r = m.list(Query::new(), &ctx).await.unwrap();
     r.data.iter().map(dbmr::core::row_to_json).collect()
+}
+
+#[tokio::test]
+async fn item_delete_keeps_its_target_when_a_hook_filters_the_collection() {
+    let model = notes(db().await)
+        .hooks(ModelHooks::new().before_delete(|_, _| async { Ok(json!({"title": "draft"})) }))
+        .require_scope(["tenant_id"])
+        .build()
+        .unwrap();
+    let ctx = Context::new().with_scope([("tenant_id", "a")]);
+    for _ in 0..2 {
+        model
+            .insert(json_to_row(&json!({"title": "draft"})), &ctx)
+            .await
+            .unwrap();
+    }
+    let (status, summary) = call(&app(model.clone()), "DELETE", "/notes/1", "a", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(summary["rows"], 1);
+    assert!(model.by_id(1, &ctx).await.unwrap().is_none());
+    assert!(model.by_id(2, &ctx).await.unwrap().is_some());
 }
 
 #[tokio::test]

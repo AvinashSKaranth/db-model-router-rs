@@ -6,8 +6,10 @@ use serde_json::json;
 #[tokio::test]
 async fn e2_tenant_isolation() {
     let app = app::build_app(SqliteAdapter::connect("sqlite::memory:").await.unwrap()).await.unwrap();
-    let (a, b) = (&[("x-tenant", "a")][..], &[("x-tenant", "b")][..]);
-    assert_eq!(call(&app, "GET", "/notes", &[], None).await.status, 401, "no tenant header");
+    let (a, b) = (&[("authorization", "Bearer fixture-a")][..], &[("authorization", "Bearer fixture-b"), ("x-tenant", "a")][..]);
+    assert_eq!(call(&app, "GET", "/notes", &[], None).await.status, 401, "no credentials");
+    assert_eq!(call(&app, "GET", "/notes", &[("x-tenant", "a")], None).await.status, 401, "tenant header is not a credential");
+    assert_eq!(call(&app, "GET", "/notes", &[("authorization", "Bearer invalid")], None).await.status, 401, "unrecognized credential");
 
     let r = call(&app, "POST", "/notes/0", a, Some(json!({"title":"secret","tenant_id":"b"}))).await;
     assert_eq!(r.status, 200, "{}", r.text);

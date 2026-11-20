@@ -66,6 +66,28 @@ contenders in the same session.
 
 CI job `bench` only builds the harness.
 
+### Scoped Axum endpoints on SQLite
+
+Run `cargo run --release -p dbmr-bench --bin scoped_router`. The two routers share one
+in-memory SQLite connection and the same indexed data. Both receive a trusted tenant
+scope. The benchmark checks their success responses for equality before timing 2,000
+in-process requests per scenario at concurrency 1 and 8. Output includes throughput
+and p50, p95, and p99.
+
+One Windows run at concurrency 8 measured the following p95 latencies:
+
+| Request | Raw Axum + SQLx | dbmr |
+|---|---:|---:|
+| Item GET | 1.15 ms | 1.61 ms |
+| List with total count | 2.61 ms | 4.86 ms |
+| PATCH | 1.16 ms | 3.20 ms |
+
+Both read paths issue one query for an item and two for a counted list. The raw
+PATCH uses `UPDATE … RETURNING` in one round trip. The generated PATCH does a
+visibility precheck, a guarded update, and a scoped re-read. These measurements
+characterize the SQLite router on one host. The PostgreSQL budgets above still need
+a matched live comparison.
+
 ## Execution log
 
 | Date | Commit | Environment | Result |

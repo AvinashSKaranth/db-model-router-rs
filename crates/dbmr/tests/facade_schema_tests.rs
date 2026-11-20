@@ -12,6 +12,46 @@ async fn db() -> Arc<dyn DatabaseAdapter> {
 }
 
 #[tokio::test]
+async fn schema_scope_survives_print_and_is_required_by_the_router() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let db = db().await;
+    db.query(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        &[],
+    )
+    .await
+    .unwrap();
+    let schema = r#"{
+        "adapter": "sqlite3", "framework": "axum",
+        "tables": {"notes": {"columns": {"id": "integer", "tenant_id": "string"},
+            "require_scope": ["tenant_id"]}}
+    }"#;
+    let printed = dbmr::schema::print_schema(&dbmr::schema::parse_schema(schema).unwrap());
+    let models = load_models_from_schema(&db, &printed, None).unwrap();
+    let router = dbmr::create_model_router(models["notes"].clone());
+    let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+    assert_eq!(
+        router.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let request = Request::builder()
+        .uri("/")
+        .extension(dbmr::Scope::new([("tenant_id", "a")]))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn invalid_schema_is_422_with_validation_detail() {
     let err = load_models_from_schema(&db().await, r#"{"adapter":"db2"}"#, None)
         .err()

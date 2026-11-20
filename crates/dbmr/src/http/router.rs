@@ -48,7 +48,7 @@ use crate::core::hooks::{Context, CurrentUser, Scope};
 use crate::core::model::Model;
 use crate::core::query::Query;
 use crate::core::types::{json_to_row, row_to_json, DbValue, RowMap, WriteSummary};
-use crate::core::{data_to_filter, json_safe_parse, CONFLICT_MESSAGE};
+use crate::core::{data_to_filter, CONFLICT_MESSAGE};
 use crate::http::formatter::{format_csv, format_xml};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -144,7 +144,7 @@ pub fn create_model_router(model: impl Into<Arc<Model>>) -> Router {
 /// [`create_model_router`] serving only the operations enabled in `options`.
 pub fn create_model_router_with(model: impl Into<Arc<Model>>, options: RouterOptions) -> Router {
     let state = Arc::new(ModelRouterState {
-        model: model.into(),
+        model: Arc::new(model.into().public_view()),
         options,
     });
     Router::new()
@@ -295,7 +295,6 @@ async fn read_request(params: HashMap<String, String>, req: Request) -> Result<R
     let mut path_params = Map::new();
     for (k, v) in params {
         if k == ID_PARAM {
-            path_params.insert("id".into(), Value::String(v.clone()));
             id = Some(v);
         } else {
             path_params.insert(k, Value::String(v));
@@ -332,6 +331,12 @@ async fn read_request(params: HashMap<String, String>, req: Request) -> Result<R
     let headers: Map<String, Value> = parts
         .headers
         .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "authorization" | "proxy-authorization" | "cookie" | "x-api-key"
+            )
+        })
         .filter_map(|(k, v)| {
             Some((
                 k.as_str().to_string(),
@@ -363,10 +368,14 @@ async fn read_request(params: HashMap<String, String>, req: Request) -> Result<R
         .get::<Scope>()
         .map(|s| s.0.clone())
         .unwrap_or_default();
+    let mut hook_params = path_params.clone();
+    if let Some(id) = &id {
+        hook_params.insert("id".into(), Value::String(id.clone()));
+    }
     let json = json!({
         "method": parts.method.as_str(),
         "path": parts.uri.path(),
-        "params": path_params,
+        "params": hook_params,
         "query": query,
         "headers": headers,
         "body": body,
@@ -432,29 +441,45 @@ fn data_array(body: &Value) -> Option<&Value> {
 
 /// Remove hidden columns from an object, each array item, and each `data` item.
 fn strip_hidden(v: &mut Value, hidden: &[String]) {
-    let hidden_lower: Vec<String> = hidden.iter().map(|s| s.trim().to_lowercase()).collect();
+    let hidden: Vec<String> = hidden.iter().map(|s| s.trim().to_lowercase()).collect();
+    strip_hidden_normalized(v, &hidden);
+}
+
+fn strip_hidden_normalized(v: &mut Value, hidden: &[String]) {
     match v {
-        Value::Array(a) => a.iter_mut().for_each(|x| strip_hidden(x, hidden)),
+        Value::Array(a) => a
+            .iter_mut()
+            .for_each(|x| strip_hidden_normalized(x, hidden)),
         Value::Object(o) => {
-            o.retain(|k, _| !hidden_lower.contains(&k.trim().to_lowercase()));
+            o.retain(|k, _| !hidden.contains(&k.trim().to_lowercase()));
             if let Some(d) = o.get_mut("data").filter(|d| d.is_array()) {
-                strip_hidden(d, hidden);
+                strip_hidden_normalized(d, hidden);
             }
         }
         _ => {}
     }
 }
 
-/// True when a client column reference names a hidden column.
-fn touches_hidden(st: &ModelRouterState, cols: impl IntoIterator<Item = String>) -> bool {
-    let hidden: Vec<String> = st
-        .model
+/// Accept declared column names, plus the implicit primary key. Reject aliases before
+/// the database can resolve them to a different column.
+fn check_client_columns<'a>(
+    st: &ModelRouterState,
+    cols: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Response> {
+    let model = &st.model;
+    let hidden: Vec<String> = model
         .hidden_columns()
         .iter()
         .map(|s| s.trim().to_lowercase())
         .collect();
-    cols.into_iter()
-        .any(|c| hidden.contains(&c.trim().to_lowercase()))
+    if cols.into_iter().any(|col| {
+        col.contains('\0')
+            || (col != model.pk() && !model.structure().contains_key(col))
+            || hidden.contains(&col.trim().to_lowercase())
+    }) {
+        return Err(invalid_filter());
+    }
+    Ok(())
 }
 
 /// Parse a read payload; hidden columns are `422`, a disabled export is `400`.
@@ -465,11 +490,15 @@ fn read_query(st: &ModelRouterState, payload: &Value) -> Result<(Query, Option<S
         .groups
         .iter()
         .flatten()
-        .map(|c| c.column.to_string())
-        .chain(q.sort.iter().map(|s| s.column.to_string()))
-        .chain(q.select_columns.iter().flatten().cloned());
-    if touches_hidden(st, cols) {
-        return Err(invalid_filter());
+        .map(|c| c.column.as_str())
+        .chain(q.sort.iter().map(|s| s.column.as_str()))
+        .chain(q.select_columns.iter().flatten().map(String::as_str));
+    check_client_columns(st, cols)?;
+    if q.search.as_deref().is_some_and(|s| !s.is_empty()) {
+        check_client_columns(
+            st,
+            st.model.options().search_columns.iter().map(String::as_str),
+        )?;
     }
     if !st.options.export && matches!(output.as_deref(), Some("csv" | "xml")) {
         return Err(bad_request("Export is disabled"));
@@ -479,12 +508,8 @@ fn read_query(st: &ModelRouterState, payload: &Value) -> Result<(Query, Option<S
 
 /// Delete criteria must not filter on hidden columns either (row counts would leak them).
 fn check_delete_criteria(st: &ModelRouterState, criteria: &Value) -> Result<(), Response> {
-    if let Ok(f) = data_to_filter(&json_safe_parse(criteria), st.model.pk()) {
-        if touches_hidden(st, f.groups.iter().flatten().map(|c| c.column.to_string())) {
-            return Err(invalid_filter());
-        }
-    }
-    Ok(())
+    let f = data_to_filter(criteria, st.model.pk()).map_err(|e| error_response(&e))?;
+    check_client_columns(st, f.groups.iter().flatten().map(|c| c.column.as_str()))
 }
 
 // ------------------------------------------------------------------ handlers
@@ -596,21 +621,12 @@ async fn item_inner(
             "Bulk writes ({\"data\": [...]}) use the collection route",
         ));
     }
-    let id_raw = req.id.clone().unwrap_or_default();
     let pk_name = m.pk();
-    let pk_rule = m.structure().get(pk_name).map_or("string", String::as_str);
-    let pk_literal: DbValue = if pk_rule.starts_with("int") || pk_rule == "auto_increment" {
-        match id_raw.parse::<i128>() {
-            Ok(n) => DbValue::Int(n),
-            Err(_) => DbValue::Text(id_raw.clone()),
-        }
-    } else {
-        DbValue::Text(id_raw.clone())
-    };
-    let pk_json_val = match &pk_literal {
-        DbValue::Int(n) => serde_json::Number::from_i128(*n)
-            .map_or_else(|| Value::String(id_raw.clone()), Value::Number),
-        _ => Value::String(id_raw.clone()),
+    let item_id = || {
+        req.id
+            .as_deref()
+            .and_then(|id| m.path_id(id))
+            .ok_or_else(not_found)
     };
 
     let res = match req.method.as_str() {
@@ -626,12 +642,8 @@ async fn item_inner(
             if let Value::Object(o) = &mut input {
                 o.remove(pk_name);
             }
-            let (mut q, output) = read_query(st, &input)?;
-            // Apply primary-key equality independently of client filters
-            q.filter = q.filter.and(pk_name, Operator::Eq, pk_literal.clone());
-            q.limit = Some(1);
-            q.count = Some(false);
-            m.find(q, ctx)
+            let (q, output) = read_query(st, &input)?;
+            m.find_item(q, item_id()?, ctx)
                 .await
                 .map(|r| match r.data.into_iter().next() {
                     Some(rec) => {
@@ -664,19 +676,17 @@ async fn item_inner(
                 return Err(method_not_allowed());
             }
             // Existence pre-check inside the scope (§20.2).
-            let check = FilterExpr::eq(pk_name, pk_literal.clone());
-            let exists = || async {
-                m.find_one(Query::filter(check.clone()), ctx)
-                    .await
-                    .map(|r| r.is_some())
-                    .map_err(|e| error_response(&e))
-            };
-            if !exists().await? {
+            let id = item_id()?;
+            let found = m
+                .find_item(Query::default(), id.clone(), ctx)
+                .await
+                .map_err(|e| error_response(&e))?;
+            if found.data.is_empty() {
                 return Err(not_found());
             }
             let mut payload = body;
             if let Value::Object(o) = &mut payload {
-                o.insert(pk_name.to_string(), pk_json_val.clone());
+                o.insert(pk_name.to_string(), id.to_json());
             }
             if req.method.as_str() == "PUT" {
                 m.update(json_to_row(&payload), ctx)
@@ -694,37 +704,31 @@ async fn item_inner(
             }
             let payload = req.write_body(m);
             check_delete_criteria(st, &payload)?;
-            let check = FilterExpr::eq(pk_name, pk_literal.clone());
+            let id = item_id()?;
             let exists = || async {
-                m.find_one(Query::filter(check.clone()), ctx)
+                m.find_item(Query::default(), id.clone(), ctx)
                     .await
-                    .map(|r| r.is_some())
+                    .map(|r| !r.data.is_empty())
                     .map_err(|e| error_response(&e))
             };
             if !exists().await? {
                 return Err(not_found());
             }
-            let versioned = m
+            let mut delete_filter = FilterExpr::eq(pk_name, id.clone());
+            let version = m
                 .version_column()
-                .is_some_and(|vc| payload.get(vc).is_some_and(|v| !v.is_null()));
-            let mut delete_filter = check.clone();
-            if let Some(vc) = m.version_column() {
-                if let Some(v) = payload.get(vc).filter(|v| !v.is_null()) {
-                    delete_filter = delete_filter.and(vc, Operator::Eq, DbValue::from(v.clone()));
-                }
+                .and_then(|col| payload.get(col).filter(|v| !v.is_null()).map(|v| (col, v)));
+            if let Some((col, value)) = version {
+                let version = Model::version_value(&DbValue::from(value.clone()))
+                    .map_err(|e| error_response(&e))?;
+                delete_filter = delete_filter.and(col, Operator::Eq, DbValue::Int(version));
             }
-            match m.remove_where(&delete_filter, ctx).await {
+            match m.remove_item(&delete_filter, ctx).await {
                 // The version guard matched nothing, but the row is still there.
-                Ok(s) if s.rows == 0 && versioned && exists().await? => {
+                Ok(s) if s.rows == 0 && version.is_some() && exists().await? => {
                     Err(AppError::Conflict(CONFLICT_MESSAGE.into()))
                 }
-                Ok(mut s) => {
-                    // Enforce that item mutations affect at most one row
-                    if s.rows > 1 {
-                        s.rows = 1;
-                    }
-                    Ok(summary_json(&s))
-                }
+                Ok(s) => Ok(summary_json(&s)),
                 Err(e) => Err(e),
             }
         }

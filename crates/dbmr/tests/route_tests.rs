@@ -443,10 +443,9 @@ async fn server_errors_are_scrubbed() {
 async fn hostile_identifiers_cannot_inject() {
     let app = app().await;
     seed(&app).await;
-    // Quote-breaking column names stay one quoted identifier. (SQLite reads an unknown
-    // "identifier" as a string literal, so the filter matches nothing instead of erroring.)
+    // Reject undeclared client columns before compiling identifiers for the adapter.
     let r = call(&app, "GET", "/?name%22%20OR%201%3D1%20--=x", None).await;
-    assert_eq!(r.json()["count"], 0, "{}", r.text);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text);
     let r = call(
         &app,
         "GET",
@@ -454,7 +453,7 @@ async fn hostile_identifiers_cannot_inject() {
         None,
     )
     .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text);
     assert_eq!(call(&app, "GET", "/", None).await.json()["count"], 3);
     // Scalar IN never widens to "no filter".
     let r = call(

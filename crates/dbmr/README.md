@@ -61,7 +61,7 @@ Every `create_model_router(model)` router automatically exposes both individual 
 | `POST` | `/resources` | Individual | `{ "title": "My Post" }` | Created record `{ "id": 1, ... }` |
 | `POST` | `/resources` | Bulk | `{"data": [{ "title": "P1" }, { "title": "P2" }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
 | `PUT` | `/resources` | Bulk | `{"data": [{ "id": 1, ... }, { "id": 2, ... }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
-| `DELETE` | `/resources` | Bulk | Filter criteria object (requires `.allow_destructive(true)`) | `{"rows": n, "message": "...", "type": "success"}` |
+| `DELETE` | `/resources` | Bulk | Non-empty filter criteria object | `{"rows": n, "message": "...", "type": "success"}` |
 | `GET` | `/resources/:id` | Individual | None | Single record `{ "id": 1, ... }` |
 | `PUT` | `/resources/:id` | Individual | `{ "title": "Updated" }` (full replace) | Updated record `{ "id": 1, ... }` |
 | `PATCH` | `/resources/:id` | Individual | `{ "title": "Partial update" }` | Updated record `{ "id": 1, ... }` |
@@ -104,6 +104,6 @@ async fn main() -> dbmr::Result<()> {
 
 ## Documentation & Examples
 
-- [Blog App Example (Authors, Posts, Comments, Likes, Shares)](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/blog_app.rs)
+- [Blog App Modular Project (`index`, `migration`, `model`, `router`, `test`, `migrations/`)](https://github.com/AvinashSKaranth/db-model-router-rs/tree/master/crates/dbmr/examples/blog_app)
 - [Complete Feature Tour](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/tour.rs)
 - [API Reference on Docs.rs](https://docs.rs/dbmr)

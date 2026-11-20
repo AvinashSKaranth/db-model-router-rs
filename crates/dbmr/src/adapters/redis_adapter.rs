@@ -77,25 +77,55 @@ fn rowmap_to_hash(row: &RowMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Compare-and-set on one hash (values compared without their type tag, like
-/// `loose_eq`). ARGV: n, n x (field, expected), soft-delete field or "",
-/// then the (field, value) pairs to write. Returns 1 when written, 0 when the key is gone,
-/// a checked field changed, or the row was soft-deleted meanwhile.
+/// Compare the stored fields that matched the filter before mutating one hash.
+/// ARGV: n, n x (field, observed value or empty for absent), delete flag, field/value pairs.
 const CAS_SCRIPT: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 local n = tonumber(ARGV[1])
 for i = 0, n - 1 do
   local v = redis.call('HGET', KEYS[1], ARGV[2 + 2 * i]) or ''
-  if string.sub(v, 3) ~= string.sub(ARGV[3 + 2 * i], 3) then return 0 end
+  if v ~= ARGV[3 + 2 * i] then return 0 end
 end
-local sd = ARGV[2 + 2 * n]
-if sd ~= '' then
-  local f = redis.call('HGET', KEYS[1], sd)
-  if f == 'b:true' or f == 'i:1' then return 0 end
-end
+if ARGV[2 + 2 * n] == '1' then return redis.call('DEL', KEYS[1]) end
 redis.call('HSET', KEYS[1], unpack(ARGV, 3 + 2 * n))
 return 1
 ";
+
+const INSERT_SCRIPT: &str = r"
+if redis.call('EXISTS', KEYS[1]) ~= 0 then return 0 end
+redis.call('HSET', KEYS[1], unpack(ARGV))
+return 1
+";
+
+fn guarded_command(
+    key: &str,
+    row: &RowMap,
+    filter: &FilterExpr,
+    soft_delete: Option<&str>,
+    delete: bool,
+) -> Option<redis::Cmd> {
+    let group = filter
+        .groups
+        .iter()
+        .find(|g| g.iter().all(|c| matches_condition(row, c)));
+    if group.is_none() && !filter.is_empty() {
+        return None;
+    }
+    let fields: std::collections::BTreeSet<&str> = group
+        .into_iter()
+        .flatten()
+        .map(|c| c.column.as_str())
+        .chain(soft_delete)
+        .collect();
+    let mut cmd = redis::cmd("EVAL");
+    cmd.arg(CAS_SCRIPT).arg(1).arg(key).arg(fields.len());
+    for col in fields {
+        cmd.arg(col)
+            .arg(row.get(col).map_or_else(String::new, to_hash_value));
+    }
+    cmd.arg(u8::from(delete));
+    Some(cmd)
+}
 
 fn hash_to_rowmap(pairs: &std::collections::HashMap<String, String>) -> RowMap {
     pairs
@@ -199,6 +229,78 @@ fn matches_filter(row: &RowMap, filter: &FilterExpr, safe_delete: Option<&str>) 
         .groups
         .iter()
         .any(|group| group.iter().all(|cond| matches_condition(row, cond)))
+}
+
+impl RedisAdapter {
+    async fn write_rows(
+        &self,
+        table: &str,
+        data: &[RowMap],
+        insert_only: bool,
+    ) -> Result<WriteSummary> {
+        if data.is_empty() {
+            return Ok(WriteSummary {
+                rows: 0,
+                message: format_bulk_saved_message(table, 0),
+                id: None,
+                record: None,
+            });
+        }
+
+        let mut conn = self.get_conn().await?;
+        let mut last_id = None;
+        let mut last_record = None;
+
+        for row in data {
+            let mut row = row.clone();
+            let id = match row.get("id") {
+                Some(id) if !id.is_null() => id.clone(),
+                // Generated ids come from a per-table counter (outside the `{table}:*`
+                // row key space), so bulk inserts never collide.
+                _ => {
+                    let n: i64 = conn
+                        .incr(format!("__seq:{table}"), 1)
+                        .await
+                        .map_err(|e| AppError::Database(format!("Redis incr error: {e}")))?;
+                    let id = DbValue::Int(n.into());
+                    row.insert("id".into(), id.clone());
+                    id
+                }
+            };
+            let key = format!("{table}:{id}");
+            let pairs = rowmap_to_hash(&row);
+            if insert_only {
+                let mut cmd = redis::cmd("EVAL");
+                cmd.arg(INSERT_SCRIPT).arg(1).arg(&key);
+                for (field, value) in pairs {
+                    cmd.arg(field).arg(value);
+                }
+                let inserted: i64 = cmd
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| AppError::Database(format!("Redis hset error: {e}")))?;
+                if inserted == 0 {
+                    return Err(AppError::Conflict("Primary key already exists.".into()));
+                }
+            } else {
+                let () = conn
+                    .hset_multiple(&key, &pairs)
+                    .await
+                    .map_err(|e| AppError::Database(format!("Redis hset error: {e}")))?;
+            }
+
+            last_id = Some(id);
+            last_record = Some(row);
+        }
+
+        let count = data.len() as u64;
+        Ok(WriteSummary {
+            rows: count,
+            message: format_bulk_saved_message(table, count),
+            id: if count == 1 { last_id } else { None },
+            record: if count == 1 { last_record } else { None },
+        })
+    }
 }
 
 #[async_trait]
@@ -312,53 +414,7 @@ impl DatabaseAdapter for RedisAdapter {
         data: &[RowMap],
         _unique: &[Vec<String>],
     ) -> Result<WriteSummary> {
-        if data.is_empty() {
-            return Ok(WriteSummary {
-                rows: 0,
-                message: format_bulk_saved_message(table, 0),
-                id: None,
-                record: None,
-            });
-        }
-
-        let mut conn = self.get_conn().await?;
-        let mut last_id = None;
-        let mut last_record = None;
-
-        for row in data {
-            let mut row = row.clone();
-            let id = match row.get("id") {
-                Some(id) if !id.is_null() => id.clone(),
-                // Generated ids come from a per-table counter (outside the `{table}:*`
-                // row key space), so bulk inserts never collide.
-                _ => {
-                    let n: i64 = conn
-                        .incr(format!("__seq:{table}"), 1)
-                        .await
-                        .map_err(|e| AppError::Database(format!("Redis incr error: {e}")))?;
-                    let id = DbValue::Int(n.into());
-                    row.insert("id".into(), id.clone());
-                    id
-                }
-            };
-            let key = format!("{table}:{id}");
-            let pairs = rowmap_to_hash(&row);
-            let () = conn
-                .hset_multiple(&key, &pairs)
-                .await
-                .map_err(|e| AppError::Database(format!("Redis hset error: {e}")))?;
-
-            last_id = Some(id);
-            last_record = Some(row);
-        }
-
-        let count = data.len() as u64;
-        Ok(WriteSummary {
-            rows: count,
-            message: format_bulk_saved_message(table, count),
-            id: if count == 1 { last_id } else { None },
-            record: if count == 1 { last_record } else { None },
-        })
+        self.write_rows(table, data, true).await
     }
 
     async fn upsert_rows(
@@ -371,7 +427,7 @@ impl DatabaseAdapter for RedisAdapter {
         for row in data {
             rows.push(crate::adapters::compiler::merge_existing(self, table, row, unique).await?);
         }
-        self.insert_rows(table, &rows, unique).await
+        self.write_rows(table, &rows, false).await
     }
 
     async fn remove_rows(
@@ -389,18 +445,18 @@ impl DatabaseAdapter for RedisAdapter {
         for row in &res.data {
             if let Some(id) = row.get("id") {
                 let key = format!("{table}:{id}");
-                if let Some(sd) = safe_delete {
-                    let () = conn
-                        .hset(&key, sd, to_hash_value(&DbValue::Bool(true)))
-                        .await
-                        .map_err(|e| AppError::Database(format!("Redis hset error: {e}")))?;
-                    deleted += 1;
+                let Some(mut cmd) =
+                    guarded_command(&key, row, filter, safe_delete, safe_delete.is_none())
+                else {
                     continue;
+                };
+                if let Some(sd) = safe_delete {
+                    cmd.arg(sd).arg(to_hash_value(&DbValue::Bool(true)));
                 }
-                let changes: i64 = conn
-                    .del(&key)
+                let changes: i64 = cmd
+                    .query_async(&mut conn)
                     .await
-                    .map_err(|e| AppError::Database(format!("Redis del error: {e}")))?;
+                    .map_err(|e| AppError::Database(format!("Redis delete error: {e}")))?;
                 if changes > 0 {
                     deleted += 1;
                 }
@@ -415,11 +471,8 @@ impl DatabaseAdapter for RedisAdapter {
         })
     }
 
-    /// Scan + match, then one Lua compare-and-set per matched key: the Eq conditions of the
-    /// group that matched (e.g. `id` and `version`) and the soft-delete flag are re-checked
-    /// atomically with the write, so a concurrent change makes that row not count.
-    // ponytail: only Eq conditions are re-checked server-side; range/LIKE conditions are
-    // checked at scan time only. Move the whole matcher into Lua if that ever matters.
+    /// Compare the fields of the matched group and the soft-delete flag atomically with
+    /// the update, including fields matched by list-valued scopes.
     async fn update_where(
         &self,
         table: &str,
@@ -437,21 +490,11 @@ impl DatabaseAdapter for RedisAdapter {
         let mut changed = 0;
         for row in &res.data {
             let Some(id) = row.get("id") else { continue };
-            let checks: Vec<&Condition> = filter
-                .groups
-                .iter()
-                .find(|g| g.iter().all(|c| matches_condition(row, c)))
-                .map(|g| g.iter().filter(|c| c.operator == Operator::Eq).collect())
-                .unwrap_or_default();
-            let mut cmd = redis::cmd("EVAL");
-            cmd.arg(CAS_SCRIPT)
-                .arg(1)
-                .arg(format!("{table}:{id}"))
-                .arg(checks.len());
-            for c in checks {
-                cmd.arg(c.column.as_str()).arg(to_hash_value(&c.value));
-            }
-            cmd.arg(safe_delete.unwrap_or(""));
+            let Some(mut cmd) =
+                guarded_command(&format!("{table}:{id}"), row, filter, safe_delete, false)
+            else {
+                continue;
+            };
             for (k, v) in rowmap_to_hash(set) {
                 cmd.arg(k).arg(v);
             }

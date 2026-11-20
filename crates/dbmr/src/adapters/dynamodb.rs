@@ -392,6 +392,136 @@ fn matches_filter(row: &RowMap, filter: &FilterExpr, safe_delete: Option<&str>) 
     false
 }
 
+impl DynamoDbAdapter {
+    async fn mutate_matching(
+        &self,
+        table: &str,
+        filter: &FilterExpr,
+        soft_delete: Option<&str>,
+        set: Option<&[(&CompactString, &DbValue)]>,
+    ) -> Result<u64> {
+        let matches = self
+            .get(table, filter, &[], soft_delete, GetOptions::default())
+            .await?;
+        let mut changed = 0;
+        for row in &matches.data {
+            let Some(id) = row.get("id") else { continue };
+            let group = filter.groups.iter().find(|g| {
+                matches_filter(
+                    row,
+                    &FilterExpr {
+                        groups: vec![(*g).clone()],
+                    },
+                    None,
+                )
+            });
+            if group.is_none() && !filter.is_empty() {
+                continue;
+            }
+            let fields: std::collections::BTreeSet<&str> = group
+                .into_iter()
+                .flatten()
+                .map(|c| c.column.as_str())
+                .chain(soft_delete)
+                .filter(|c| *c != "id")
+                .collect();
+            let mut names = serde_json::Map::new();
+            let mut values = serde_json::Map::new();
+            names.insert("#pk".into(), json!("id"));
+            let mut conds = vec!["attribute_exists(#pk)".to_string()];
+            for (i, col) in fields.into_iter().enumerate() {
+                names.insert(format!("#c{i}"), json!(col));
+                if let Some(value) = row.get(col) {
+                    values.insert(format!(":c{i}"), dbvalue_to_dynamo(value));
+                    conds.push(format!("#c{i} = :c{i}"));
+                } else {
+                    conds.push(format!("attribute_not_exists(#c{i})"));
+                }
+            }
+            let mut payload = json!({
+                "TableName": table,
+                "Key": { "id": dbvalue_to_dynamo(id) },
+                "ConditionExpression": conds.join(" AND "),
+            });
+            let action = if let Some(set) = set {
+                let mut assignments = Vec::new();
+                for (i, (col, value)) in set.iter().enumerate() {
+                    names.insert(format!("#s{i}"), json!(col.as_str()));
+                    values.insert(format!(":s{i}"), dbvalue_to_dynamo(value));
+                    assignments.push(format!("#s{i} = :s{i}"));
+                }
+                payload["UpdateExpression"] = json!(format!("SET {}", assignments.join(", ")));
+                "UpdateItem"
+            } else {
+                "DeleteItem"
+            };
+            payload["ExpressionAttributeNames"] = Value::Object(names);
+            if !values.is_empty() {
+                payload["ExpressionAttributeValues"] = Value::Object(values);
+            }
+            let (status, body) = self.send_raw(action, &payload).await?;
+            if status.is_success() {
+                changed += 1;
+            } else if !condition_failed(&body) {
+                return Err(dynamo_error(status, &body));
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn write_rows(
+        &self,
+        table: &str,
+        data: &[RowMap],
+        insert_only: bool,
+    ) -> Result<WriteSummary> {
+        if data.is_empty() {
+            return Ok(WriteSummary {
+                rows: 0,
+                message: format_bulk_saved_message(table, 0),
+                id: None,
+                record: None,
+            });
+        }
+
+        let mut last_id = None;
+        let mut last_record = None;
+        for row in data {
+            let mut row = row.clone();
+            if row.get("id").is_none_or(DbValue::is_null) {
+                row.insert("id".into(), DbValue::Text(generate_id()));
+            }
+            let item = rowmap_to_dynamo_item(&row);
+            let mut payload = json!({
+                "TableName": table,
+                "Item": item
+            });
+
+            if insert_only {
+                payload["ConditionExpression"] = json!("attribute_not_exists(#pk)");
+                payload["ExpressionAttributeNames"] = json!({"#pk": "id"});
+            }
+            let (status, body) = self.send_raw("PutItem", &payload).await?;
+            if condition_failed(&body) {
+                return Err(AppError::Conflict("Primary key already exists.".into()));
+            }
+            if !status.is_success() {
+                return Err(dynamo_error(status, &body));
+            }
+            last_id = row.get("id").cloned();
+            last_record = Some(row);
+        }
+
+        let count = data.len() as u64;
+        Ok(WriteSummary {
+            rows: count,
+            message: format_bulk_saved_message(table, count),
+            id: if count == 1 { last_id } else { None },
+            record: if count == 1 { last_record } else { None },
+        })
+    }
+}
+
 #[async_trait]
 impl DatabaseAdapter for DynamoDbAdapter {
     async fn disconnect(&self) -> Result<()> {
@@ -506,40 +636,7 @@ impl DatabaseAdapter for DynamoDbAdapter {
         data: &[RowMap],
         _unique: &[Vec<String>],
     ) -> Result<WriteSummary> {
-        if data.is_empty() {
-            return Ok(WriteSummary {
-                rows: 0,
-                message: format_bulk_saved_message(table, 0),
-                id: None,
-                record: None,
-            });
-        }
-
-        let mut last_id = None;
-        let mut last_record = None;
-        for row in data {
-            let mut row = row.clone();
-            if row.get("id").is_none_or(DbValue::is_null) {
-                row.insert("id".into(), DbValue::Text(generate_id()));
-            }
-            let item = rowmap_to_dynamo_item(&row);
-            let payload = json!({
-                "TableName": table,
-                "Item": item
-            });
-
-            self.send_action("PutItem", payload).await?;
-            last_id = row.get("id").cloned();
-            last_record = Some(row);
-        }
-
-        let count = data.len() as u64;
-        Ok(WriteSummary {
-            rows: count,
-            message: format_bulk_saved_message(table, count),
-            id: if count == 1 { last_id } else { None },
-            record: if count == 1 { last_record } else { None },
-        })
+        self.write_rows(table, data, true).await
     }
 
     async fn upsert_rows(
@@ -552,7 +649,7 @@ impl DatabaseAdapter for DynamoDbAdapter {
         for row in data {
             rows.push(crate::adapters::compiler::merge_existing(self, table, row, unique).await?);
         }
-        self.insert_rows(table, &rows, unique).await
+        self.write_rows(table, &rows, false).await
     }
 
     async fn remove_rows(
@@ -561,34 +658,12 @@ impl DatabaseAdapter for DynamoDbAdapter {
         filter: &FilterExpr,
         safe_delete: Option<&str>,
     ) -> Result<WriteSummary> {
-        let matches = self
-            .get(table, filter, &[], safe_delete, GetOptions::default())
-            .await?;
-        let count = matches.data.len() as u64;
-
-        for row in &matches.data {
-            if let Some(id_val) = row.get("id") {
-                if let Some(sd) = safe_delete {
-                    let mut updated = row.clone();
-                    updated.insert(CompactString::new(sd), DbValue::Int(1));
-                    let item = rowmap_to_dynamo_item(&updated);
-                    let payload = json!({
-                        "TableName": table,
-                        "Item": item
-                    });
-                    self.send_action("PutItem", payload).await?;
-                } else {
-                    let payload = json!({
-                        "TableName": table,
-                        "Key": {
-                            "id": dbvalue_to_dynamo(id_val)
-                        }
-                    });
-                    self.send_action("DeleteItem", payload).await?;
-                }
-            }
-        }
-
+        let count = if let Some(col) = safe_delete {
+            let set = crate::core::types::row([(col, DbValue::Int(1))]);
+            self.update_where(table, &set, filter, safe_delete).await?
+        } else {
+            self.mutate_matching(table, filter, None, None).await?
+        };
         Ok(WriteSummary {
             rows: count,
             message: format_remove_message(table, count),
@@ -597,12 +672,8 @@ impl DatabaseAdapter for DynamoDbAdapter {
         })
     }
 
-    /// Scan + match, then one conditional `UpdateItem` per matched item. The condition
-    /// re-checks that the item still exists, the Eq conditions of the group that matched
-    /// (e.g. `id` and `version`) and the soft-delete flag, so a concurrent change makes that
-    /// item fail its condition and not count. `id` (the hash key) is immutable and skipped.
-    // ponytail: only non-null Eq conditions are re-checked server-side; range/LIKE are
-    // checked at scan time only. Translate them into the ConditionExpression if needed.
+    /// The fields that matched the filter and the soft-delete flag are compared
+    /// atomically with the update, including fields matched by list-valued scopes.
     async fn update_where(
         &self,
         table: &str,
@@ -614,62 +685,8 @@ impl DatabaseAdapter for DynamoDbAdapter {
         if set.is_empty() {
             return Ok(0);
         }
-        let matches = self
-            .get(table, filter, &[], safe_delete, GetOptions::default())
-            .await?;
-        let mut changed = 0;
-        for row in &matches.data {
-            let Some(id) = row.get("id") else { continue };
-            let mut names = serde_json::Map::new();
-            let mut values = serde_json::Map::new();
-            let mut sets = Vec::new();
-            for (i, (k, v)) in set.iter().enumerate() {
-                names.insert(format!("#s{i}"), json!(k.as_str()));
-                values.insert(format!(":s{i}"), dbvalue_to_dynamo(v));
-                sets.push(format!("#s{i} = :s{i}"));
-            }
-            names.insert("#pk".into(), json!("id"));
-            let mut conds = vec!["attribute_exists(#pk)".to_string()];
-            let group = filter.groups.iter().find(|g| {
-                let one = FilterExpr {
-                    groups: vec![(*g).clone()],
-                };
-                matches_filter(row, &one, None)
-            });
-            let eqs = group
-                .into_iter()
-                .flatten()
-                .filter(|c| c.operator == Operator::Eq && !c.value.is_null());
-            for (i, c) in eqs.enumerate() {
-                names.insert(format!("#c{i}"), json!(c.column.as_str()));
-                values.insert(format!(":c{i}"), dbvalue_to_dynamo(&c.value));
-                conds.push(format!("#c{i} = :c{i}"));
-            }
-            if let Some(sd) = safe_delete {
-                names.insert("#sd".into(), json!(sd));
-                values.insert(":sd1".into(), json!({ "N": "1" }));
-                values.insert(":sdt".into(), json!({ "BOOL": true }));
-                conds.push("NOT (#sd = :sd1 OR #sd = :sdt)".into());
-            }
-            let payload = json!({
-                "TableName": table,
-                "Key": { "id": dbvalue_to_dynamo(id) },
-                "UpdateExpression": format!("SET {}", sets.join(", ")),
-                "ConditionExpression": conds.join(" AND "),
-                "ExpressionAttributeNames": names,
-                "ExpressionAttributeValues": values,
-            });
-            let (status, body) = self.send_raw("UpdateItem", &payload).await?;
-            if status.is_success() {
-                changed += 1;
-            } else if !body["__type"]
-                .as_str()
-                .is_some_and(|t| t.ends_with("ConditionalCheckFailedException"))
-            {
-                return Err(dynamo_error(status, &body));
-            }
-        }
-        Ok(changed)
+        self.mutate_matching(table, filter, safe_delete, Some(&set))
+            .await
     }
 
     async fn ping(&self) -> Result<()> {
@@ -687,6 +704,12 @@ impl DatabaseAdapter for DynamoDbAdapter {
     fn escape_id(&self, name: &str) -> String {
         name.to_string()
     }
+}
+
+fn condition_failed(body: &Value) -> bool {
+    body["__type"]
+        .as_str()
+        .is_some_and(|kind| kind.ends_with("ConditionalCheckFailedException"))
 }
 
 fn dynamo_error(status: reqwest::StatusCode, body: &Value) -> AppError {

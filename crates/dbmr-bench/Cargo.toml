@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish = false
+default-run = "dbmr-bench"
 
 [[bin]]
 name = "dbmr-bench"
@@ -14,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 dbmr = { path = "../dbmr", features = ["sqlite", "postgres"] }
 tokio = { workspace = true, features = ["full"] }
+axum.workspace = true
+tower = { workspace = true, features = ["util"] }
 sqlx = { workspace = true, features = ["sqlite", "postgres"] }
 indexmap.workspace = true
 compact_str.workspace = true

@@ -1,5 +1,5 @@
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::Router;
@@ -9,7 +9,11 @@ use serde_json::json;
 use std::sync::Arc;
 
 async fn auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    let t = req.headers().get("x-tenant").and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?.to_string();
+    let t = match req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        Some("Bearer fixture-a") => "a",
+        Some("Bearer fixture-b") => "b",
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
     req.extensions_mut().insert(CurrentUser(json!({ "tenant_id": t })));
     req.extensions_mut().insert(Scope::new([("tenant_id", json!(t))]));
     Ok(next.run(req).await)

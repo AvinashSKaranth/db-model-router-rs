@@ -379,10 +379,13 @@ async fn bulk_put_carries_versions_per_row() {
         &app,
         "PUT",
         "/",
-        Some(json!({"data": [{"id": 1, "name": "A3", "version": 1}]})),
+        Some(json!({"data": [{"id": 2, "name": "B3", "version": 2}, {"id": 1, "name": "A3", "version": 1}]})),
     )
     .await;
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text);
+    let unchanged = call(&app, "GET", "/2", None).await.json();
+    assert_eq!(unchanged["name"], "B2");
+    assert_eq!(unchanged["version"], 2);
     let r = call(
         &app,
         "PUT",
@@ -530,7 +533,10 @@ async fn openapi_document_follows_models_and_options() {
         .and_then(|v| v.as_array())
         .and_then(|a| a.first())
         .unwrap_or(post_schema);
-    assert_eq!(single["$ref"], "#/components/schemas/accountsCreate");
+    assert_eq!(
+        single["allOf"][0]["$ref"],
+        "#/components/schemas/accountsCreate"
+    );
     let bulk = post_schema
         .get("oneOf")
         .and_then(|v| v.as_array())
@@ -539,6 +545,19 @@ async fn openapi_document_follows_models_and_options() {
     assert_eq!(
         bulk["properties"]["data"]["items"]["$ref"],
         "#/components/schemas/accountsCreate"
+    );
+    assert_eq!(single["not"]["required"], json!(["data"]));
+    assert_eq!(single["not"]["properties"]["data"]["type"], "array");
+    let schema =
+        &paths["/accounts"]["post"]["responses"]["200"]["content"]["application/json"]["schema"];
+    assert_eq!(
+        schema["oneOf"][0]["allOf"][0]["$ref"],
+        "#/components/schemas/accounts"
+    );
+    assert_eq!(schema["oneOf"][0]["not"], schema["oneOf"][1]);
+    assert_eq!(
+        schema["oneOf"][1]["$ref"],
+        "#/components/schemas/BulkSummary"
     );
     let list =
         &paths["/accounts"]["get"]["responses"]["200"]["content"]["application/json"]["schema"];

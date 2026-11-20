@@ -69,7 +69,7 @@ Every `create_model_router(model)` router automatically exposes both individual 
 | `POST` | `/resources` | Individual | `{ "title": "My Post" }` | Created record `{ "id": 1, ... }` |
 | `POST` | `/resources` | Bulk | `{"data": [{ "title": "P1" }, { "title": "P2" }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
 | `PUT` | `/resources` | Bulk | `{"data": [{ "id": 1, ... }, { "id": 2, ... }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
-| `DELETE` | `/resources` | Bulk | Filter criteria object (requires `.allow_destructive(true)`) | `{"rows": n, "message": "...", "type": "success"}` |
+| `DELETE` | `/resources` | Bulk | Non-empty filter criteria object | `{"rows": n, "message": "...", "type": "success"}` |
 | `GET` | `/resources/:id` | Individual | None | Single record `{ "id": 1, ... }` |
 | `PUT` | `/resources/:id` | Individual | `{ "title": "Updated" }` (full replace) | Updated record `{ "id": 1, ... }` |
 | `PATCH` | `/resources/:id` | Individual | `{ "title": "Partial update" }` | Updated record `{ "id": 1, ... }` |
@@ -80,7 +80,7 @@ Every `create_model_router(model)` router automatically exposes both individual 
 The complete, compiled version is [`crates/dbmr/examples/quickstart.rs`](crates/dbmr/examples/quickstart.rs).
 Run it with `cargo run -p dbmr --example quickstart`. Every other feature is shown, with
 asserts, in [`crates/dbmr/examples/tour.rs`](crates/dbmr/examples/tour.rs)
-(`cargo run -p dbmr --example tour`).
+(`cargo run -p dbmr --example tour`). For a full modular project structured with `index`, `migration` (with a folder for migrations executed before the app starts), `model`, `router`, and `test`, see [`crates/dbmr/examples/blog_app/`](crates/dbmr/examples/blog_app/) (`cargo run -p dbmr --example blog_app`).
 
 ```rust
 use dbmr::adapters::SqliteAdapter;
@@ -185,7 +185,7 @@ tx.commit().await?;               // events are emitted only now
 
 **From a schema file:** `dbmr::load_models_from_schema(&adapter, json, encryption)`
 returns an `IndexMap<table, Model>`. Per-table keys `softDelete`, `hidden`, `version` and
-`timestamps` map to the builder methods above; `relationships` add `has_many` (named after
+`timestamps` map to the builder methods above. `require_scope` lists declared columns whose scope must be present; `relationships` add `has_many` (named after
 the child table) on the parent and `belongs_to` (named after the parent table) on the child.
 
 ### Same contract on every adapter
@@ -202,7 +202,7 @@ Values follow the declared rule on every adapter: writes convert text forms (`"9
 | GET | List (paged) `{data, count}` | Row by id, or 404 `{"message":"Not Found","type":"danger"}` |
 | QUERY | List; the filter is in the JSON body | Same as GET |
 | POST | One object: single insert, returns the record. `{"data":[...]}`: bulk insert | Single insert; the path id is ignored |
-| PUT | Bulk update (upserts on unique key or PK), body `{"data":[...]}` (400 otherwise) | Update row id; 404 if the row is not visible |
+| PUT | Bulk update (scoped models update existing rows by PK), body `{"data":[...]}` (400 otherwise) | Update row id; 404 if the row is not visible |
 | PATCH | – (405) | Partial update; 404 if not visible |
 | DELETE | Delete by filter body (400 if empty) | Delete row id; 404 if not visible |
 

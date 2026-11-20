@@ -35,6 +35,8 @@ pub trait DatabaseAdapter: Send + Sync + 'static {
         safe_delete: Option<&str>,
     ) -> Result<u64>;
 
+    /// Insert new rows. A primary-key collision must fail without changing the existing
+    /// row. Guarded model upserts use this operation when their conditional update misses.
     async fn insert_rows(
         &self,
         table: &str,
@@ -58,7 +60,8 @@ pub trait DatabaseAdapter: Send + Sync + 'static {
 
     /// `UPDATE table SET <set> WHERE <filter>`, skipping soft-deleted rows when
     /// `safe_delete` is set. Returns the number of rows changed. Used for optimistic
-    /// locking (`WHERE pk = ? AND version = ?`), so it must be a single atomic statement.
+    /// locking and scoped writes, so the filter must be enforced atomically with each
+    /// row mutation.
     async fn update_where(
         &self,
         table: &str,

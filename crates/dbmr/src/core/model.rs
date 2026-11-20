@@ -23,7 +23,7 @@
 //! # Ok(()) }
 //! ```
 
-use crate::core::adapter::DatabaseAdapter;
+use crate::core::adapter::{DatabaseAdapter, NO_TX_MESSAGE};
 use crate::core::encryption::{EncryptionConfig, EncryptionMeta};
 use crate::core::error::{AppError, Result};
 use crate::core::events::EventSink;
@@ -429,6 +429,13 @@ impl Model {
         }
     }
 
+    pub(crate) fn public_view(&self) -> Self {
+        Self {
+            reveal_hidden: false,
+            ..self.clone()
+        }
+    }
+
     /// Add a one-to-many relation: `?include=<name>` attaches `child` rows whose
     /// `foreign_key` equals this row's primary key.
     #[must_use]
@@ -484,6 +491,15 @@ impl Model {
         self.inner.primary_key.as_str()
     }
 
+    pub(crate) fn path_id(&self, id: &str) -> Option<DbValue> {
+        let pk = self.inner.rules.iter().find(|r| r.column == self.pk());
+        if pk.is_some_and(|r| matches!(r.base_type.as_deref(), Some("integer" | "auto_increment")))
+        {
+            return id.parse().ok().map(DbValue::Int);
+        }
+        (!id.is_empty()).then(|| DbValue::from(id))
+    }
+
     #[must_use]
     pub fn table_name(&self) -> &str {
         self.inner.table.as_str()
@@ -527,10 +543,13 @@ impl Model {
 
     /// Drop hidden columns from an outgoing record.
     fn conceal(&self, row: &mut RowMap) {
-        if !self.reveal_hidden {
-            for c in &self.inner.options.hidden {
-                row.shift_remove(c.as_str());
-            }
+        let hidden = &self.inner.options.hidden;
+        if !self.reveal_hidden && !hidden.is_empty() {
+            let names: Vec<_> = hidden
+                .iter()
+                .map(|name| name.trim().to_lowercase())
+                .collect();
+            row.retain(|name, _| !names.contains(&name.trim().to_lowercase()));
         }
     }
 
@@ -781,13 +800,21 @@ impl Model {
         safe_delete: Option<&str>,
         scope: &FilterExpr,
     ) -> Result<Option<RowMap>> {
-        if let Some(rec) = &summary.record {
+        if let Some(rec) = summary.record.as_ref().filter(|_| scope.is_empty()) {
             return Ok(Some(rec.clone()));
         }
         let id = summary
             .id
             .clone()
             .filter(|v| !v.is_null() && *v != DbValue::Int(0))
+            .or_else(|| {
+                summary
+                    .record
+                    .as_ref()?
+                    .get(self.pk())
+                    .filter(|v| !v.is_null())
+                    .cloned()
+            })
             .or(payload_pk.filter(|v| !v.is_null()));
         match id {
             Some(id) => {
@@ -819,12 +846,19 @@ impl Model {
     async fn write_one(&self, row: RowMap, op: BulkOp, ctx: &Context) -> Result<Option<RowMap>> {
         let scope = self.scope(ctx)?;
         let (rows, _) = self.prepare(vec![row], op, false, ctx).await?;
-        if self.version_col().is_some() && op != BulkOp::Insert {
+        if op != BulkOp::Insert && (self.version_col().is_some() || !scope.is_empty()) {
+            let target = self.write_key_columns(op, &rows);
             let row = rows.into_iter().next().unwrap_or_default();
-            let Some(key) = self.locked_write(row, op, &scope).await? else {
+            let Some(key) = self.guarded_write(row, op, &target, &scope).await? else {
                 return Ok(None);
             };
-            let Some(mut rec) = self.get_one(&key.clone().and_expr(&scope), None).await? else {
+            if key.is_empty() {
+                return Ok(None);
+            }
+            let Some(mut rec) = self
+                .get_one(&key.and_expr(&scope), self.safe_delete())
+                .await?
+            else {
                 return Ok(None);
             };
             self.decode(&mut rec)?;
@@ -884,37 +918,41 @@ impl Model {
     }
 
     /// Parse a client-supplied version (`3`, `"3"`, `3.0`).
-    fn version_value(v: &DbValue) -> Result<i128> {
+    pub(crate) fn version_value(v: &DbValue) -> Result<i128> {
         let n = match v {
             DbValue::Int(i) => Some(*i),
             DbValue::Text(t) => t.trim().trim_matches('"').parse().ok(),
             DbValue::Float(f) if f.fract() == 0.0 => Some(*f as i128),
-            DbValue::Decimal(d) => d.trunc().to_string().parse().ok(),
+            DbValue::Decimal(d) if d.fract().is_zero() => d.trunc().to_string().parse().ok(),
             _ => None,
         };
         n.ok_or_else(|| AppError::UnprocessableEntity("The version must be an integer.".into()))
     }
 
-    /// Optimistic-lock write for update/upsert of one prepared row: `UPDATE ... SET
-    /// version = v + 1 WHERE key AND version = v`. Returns the filter that finds the row
-    /// again, or `None` when an update targets no row. `409` when the row exists with a
-    /// different version, `428` when the version is missing for an existing row.
-    async fn locked_write(
-        &self,
-        mut row: RowMap,
-        op: BulkOp,
-        scope: &FilterExpr,
-    ) -> Result<Option<FilterExpr>> {
-        let vc = self.version_col().unwrap_or_default().to_string();
-        let version = row.shift_remove(vc.as_str()).filter(|v| !v.is_null());
-        let key_cols: Vec<String> = if op == BulkOp::Update {
+    fn write_key_columns(&self, op: BulkOp, rows: &[RowMap]) -> Vec<String> {
+        if op == BulkOp::Update {
             vec![self.pk().to_string()]
         } else {
-            self.conflict_target(std::slice::from_ref(&row))
+            self.conflict_target(rows)
                 .into_iter()
                 .next()
                 .unwrap_or_default()
-        };
+        }
+    }
+
+    /// Match scope and version in the same statement as the update. The upsert fallback
+    /// is insert-only, so a competing insert cannot turn into an unguarded update.
+    async fn guarded_write(
+        &self,
+        mut row: RowMap,
+        op: BulkOp,
+        key_cols: &[String],
+        scope: &FilterExpr,
+    ) -> Result<Option<FilterExpr>> {
+        let version_column = self.version_col();
+        let version = version_column
+            .and_then(|col| row.shift_remove(col))
+            .filter(|v| !v.is_null());
         let key = key_cols.iter().try_fold(FilterExpr::default(), |f, c| {
             row.get(c.as_str())
                 .filter(|v| !v.is_null())
@@ -927,25 +965,30 @@ impl Model {
                     "Primary key is required for update".into(),
                 ))
             }
-            _ => return self.locked_insert(row, None).await.map(Some),
+            _ => return self.upsert_insert(row, None).await,
         };
         let sd = self.safe_delete();
         let scoped_key = key.clone().and_expr(scope);
-        let Some(v) = version else {
+        if version_column.is_some() && version.is_none() {
             if op == BulkOp::Update || self.get_one(&scoped_key, sd).await?.is_some() {
                 return Err(AppError::PreconditionRequired(
                     VERSION_REQUIRED_MESSAGE.into(),
                 ));
             }
-            return self.locked_insert(row, Some(key)).await.map(Some);
-        };
-        let v = Self::version_value(&v)?;
+            return self.upsert_insert(row, Some(key)).await;
+        }
         let mut set = row.clone();
-        for c in &key_cols {
+        set.shift_remove(self.pk());
+        for c in key_cols {
             set.shift_remove(c.as_str());
         }
-        set.insert(CompactString::new(&vc), DbValue::Int(v + 1));
-        let guarded = scoped_key.and(&vc, Operator::Eq, DbValue::Int(v));
+        let guarded = if let (Some(col), Some(version)) = (version_column, version) {
+            let v = Self::version_value(&version)?;
+            set.insert(CompactString::new(col), Self::next_version(v)?);
+            scoped_key.clone().and(col, Operator::Eq, DbValue::Int(v))
+        } else {
+            scoped_key.clone()
+        };
         if self
             .db
             .update_where(self.table_name(), &set, &guarded, sd)
@@ -954,15 +997,28 @@ impl Model {
         {
             return Ok(Some(key));
         }
-        match self.get_one(&key.clone().and_expr(scope), sd).await? {
-            Some(_) => Err(AppError::Conflict(CONFLICT_MESSAGE.into())),
-            None if op == BulkOp::Upsert => self.locked_insert(row, Some(key)).await.map(Some),
+        match self.get_one(&scoped_key, sd).await? {
+            Some(_) if version_column.is_some() => Err(AppError::Conflict(CONFLICT_MESSAGE.into())),
+            Some(_) => Ok(Some(key)),
+            None if op == BulkOp::Upsert => self.upsert_insert(row, Some(key)).await,
             None => Ok(None),
         }
     }
 
-    /// Insert path of a versioned upsert: version 1 and the created-at stamp.
-    async fn locked_insert(&self, mut row: RowMap, key: Option<FilterExpr>) -> Result<FilterExpr> {
+    fn next_version(version: i128) -> Result<DbValue> {
+        version
+            .checked_add(1)
+            .map(DbValue::Int)
+            .ok_or_else(|| AppError::UnprocessableEntity("The version is out of range.".into()))
+    }
+
+    /// Insert path of a guarded upsert. Keep the prepared key when an adapter has no ID.
+    async fn upsert_insert(
+        &self,
+        mut row: RowMap,
+        key: Option<FilterExpr>,
+    ) -> Result<Option<FilterExpr>> {
+        let payload_id = row.get(self.pk()).filter(|id| !id.is_null()).cloned();
         if let Some(vc) = self.version_col() {
             row.insert(CompactString::new(vc), DbValue::Int(1));
         }
@@ -971,12 +1027,34 @@ impl Model {
             .db
             .insert_rows(self.table_name(), &[row], &self.inner.unique)
             .await?;
-        match summary.id.filter(|v| !v.is_null() && *v != DbValue::Int(0)) {
-            Some(id) => Ok(self.pk_filter(id)),
-            None => key.ok_or_else(|| {
-                AppError::Internal("Inserted row has no id to re-read it by".into())
-            }),
+        let id = payload_id
+            .or(summary.id)
+            .or_else(|| summary.record.and_then(|r| r.get(self.pk()).cloned()));
+        Ok(Some(
+            key.or_else(|| {
+                id.filter(|v| !v.is_null() && *v != DbValue::Int(0))
+                    .map(|id| self.pk_filter(id))
+            })
+            .unwrap_or_default(),
+        ))
+    }
+
+    async fn guarded_batch(
+        &self,
+        rows: Vec<RowMap>,
+        op: BulkOp,
+        target: &[String],
+        scope: &FilterExpr,
+    ) -> Result<u64> {
+        let mut count = 0;
+        for (i, row) in rows.into_iter().enumerate() {
+            let written = self
+                .guarded_write(row, op, target, scope)
+                .await
+                .map_err(|e| prefix_error(&e, &format!("data.{i}: ")))?;
+            count += u64::from(written.is_some());
         }
+        Ok(count)
     }
 
     async fn write_many(
@@ -989,17 +1067,36 @@ impl Model {
         for r in &mut plain {
             self.conceal(r);
         }
-        if self.version_col().is_some() && op != BulkOp::Insert {
-            let scope = self.scope(ctx)?;
-            // ponytail: one statement per row; wrap in a Transaction for all-or-nothing.
-            let mut n = 0u64;
-            for (i, row) in rows.into_iter().enumerate() {
-                match self.locked_write(row, op, &scope).await {
-                    Ok(Some(_)) => n += 1,
-                    Ok(None) => {}
-                    Err(e) => return Err(prefix_error(&e, &format!("data.{i}: "))),
+        let scope = self.scope(ctx)?;
+        if op != BulkOp::Insert && (self.version_col().is_some() || !scope.is_empty()) {
+            let target = self.write_key_columns(op, &rows);
+            let tx = if self.tx.is_some() || rows.is_empty() {
+                None
+            } else {
+                match Transaction::begin(self.db.as_ref()).await {
+                    Ok(tx) => Some(tx),
+                    Err(AppError::Internal(message)) if message == NO_TX_MESSAGE => None,
+                    Err(error) => return Err(error),
                 }
-            }
+            };
+            let n = if let Some(tx) = tx {
+                let result = self
+                    .with_tx(&tx)
+                    .guarded_batch(rows, op, &target, &scope)
+                    .await;
+                match result {
+                    Ok(n) => {
+                        tx.commit().await?;
+                        n
+                    }
+                    Err(error) => {
+                        tx.rollback().await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                self.guarded_batch(rows, op, &target, &scope).await?
+            };
             let summary = WriteSummary {
                 rows: n,
                 message: format!("{n} {} saved", self.table_name()),
@@ -1106,11 +1203,11 @@ impl Model {
         data = hooks::run(h.before_update.as_ref(), data, ctx).await?;
         self.apply_scope(&mut data, "", true, ctx)?;
         self.strip_timestamps(&mut data);
-        let Some(pk_val) = data.get(self.pk()).cloned() else {
+        if !data.contains_key(self.pk()) {
             return Err(AppError::UnprocessableEntity(
                 "Primary key is required for patch".to_string(),
             ));
-        };
+        }
         let supplied: Vec<ColumnRules> = self
             .inner
             .rules
@@ -1122,6 +1219,7 @@ impl Model {
         rules::collect_errors(&supplied, &data, "", &mut errors);
         rules::finish(&errors)?;
         rules::normalize_row(&self.inner.rules, &mut data);
+        let pk_val = data.get(self.pk()).cloned().unwrap_or(DbValue::Null);
         self.check_refs(std::slice::from_ref(&data), false, ctx)
             .await?;
         if let Some(vc) = self.version_col() {
@@ -1130,6 +1228,24 @@ impl Model {
 
         let sd = self.safe_delete();
         let key = self.pk_filter(pk_val.clone()).and_expr(&scope);
+        if !scope.is_empty() {
+            data.shift_remove(self.pk());
+            self.strip_unknown(&mut data);
+            self.stamp(&mut data, false);
+            self.encrypt(&mut data)?;
+            Self::stringify(&mut data);
+            self.db
+                .update_where(self.table_name(), &data, &key, sd)
+                .await?;
+            let Some(mut rec) = self.get_one(&key, sd).await? else {
+                return Ok(None);
+            };
+            self.decode(&mut rec)?;
+            return self
+                .finish_write(rec, BulkOp::Update, "update", ctx)
+                .await
+                .map(Some);
+        }
         let Some(mut existing) = self.get_one(&key, sd).await? else {
             return Ok(None);
         };
@@ -1181,7 +1297,7 @@ impl Model {
         self.stamp(&mut set, false);
         self.encrypt(&mut set)?;
         Self::stringify(&mut set);
-        set.insert(CompactString::new(vc), DbValue::Int(v + 1));
+        set.insert(CompactString::new(vc), Self::next_version(v)?);
         let key = self.pk_filter(pk_val).and_expr(scope);
         let sd = self.safe_delete();
         let guarded = key.clone().and(vc, Operator::Eq, DbValue::Int(v));
@@ -1216,16 +1332,44 @@ impl Model {
     /// `422 "Invalid filter Inputs"`, `400` mass-delete guard, hook and database errors.
     #[tracing::instrument(level = "debug", skip_all, fields(table = %self.inner.table))]
     pub async fn remove(&self, criteria: Value, ctx: &Context) -> Result<WriteSummary> {
+        self.remove_impl(criteria, None, ctx).await
+    }
+
+    pub(crate) async fn remove_item(
+        &self,
+        guard: &FilterExpr,
+        ctx: &Context,
+    ) -> Result<WriteSummary> {
+        self.remove_impl(filter_to_json(guard), Some(guard), ctx)
+            .await
+    }
+
+    async fn remove_impl(
+        &self,
+        criteria: Value,
+        guard: Option<&FilterExpr>,
+        ctx: &Context,
+    ) -> Result<WriteSummary> {
         let scope = self.scope(ctx)?;
+        let original = guard.map(|_| criteria.clone());
         let criteria = hooks::run(self.inner.hooks.before_delete.as_ref(), criteria, ctx).await?;
-        let parsed = json_safe_parse(&criteria);
-        let filter = self.coerce_filter(data_to_filter(&parsed, self.pk())?);
+        let (parsed, filter) = match (guard, original) {
+            (Some(guard), Some(original)) if criteria == original => (criteria, guard.clone()),
+            _ => {
+                let parsed = json_safe_parse(&criteria);
+                let filter = self.coerce_filter(data_to_filter(&parsed, self.pk())?);
+                (parsed, filter)
+            }
+        };
         // The guard looks at the caller's criteria: a scope alone does not allow
         // deleting every row in it.
-        if filter.is_empty() && !self.inner.options.allow_destructive {
+        if filter.is_empty() && guard.is_none() && !self.inner.options.allow_destructive {
             return Err(AppError::BadRequest(MASS_DELETE_MESSAGE.to_string()));
         }
-        let filter = filter.and_expr(&scope);
+        let mut filter = filter.and_expr(&scope);
+        if let Some(guard) = guard {
+            filter = filter.and_expr(guard);
+        }
         let summary = self
             .db
             .remove_rows(self.table_name(), &filter, self.safe_delete())
@@ -1437,9 +1581,7 @@ impl Model {
     /// Update/upsert targets must be inside the scope: a row whose key (the PK for
     /// update, the conflict key for upsert) names an existing row outside it is
     /// `404 "Not Found"`, so that row is neither changed nor revealed.
-    // ponytail: check-then-write, not atomic; a row another scope creates in between with
-    // the same key could still be overwritten. Push the scope into the adapter upsert if
-    // that race matters.
+    // This preflight preserves batch error reporting; mutations also check the scope.
     async fn check_targets(
         &self,
         rows: &[RowMap],
@@ -1450,14 +1592,7 @@ impl Model {
         if scope.is_empty() {
             return Ok(());
         }
-        let cols = if op == BulkOp::Update {
-            vec![self.pk().to_string()]
-        } else {
-            self.conflict_target(rows)
-                .into_iter()
-                .next()
-                .unwrap_or_default()
-        };
+        let cols = self.write_key_columns(op, rows);
         if cols.is_empty() {
             return Ok(());
         }
@@ -1609,7 +1744,12 @@ impl Model {
                     Operator::In,
                     DbValue::Json(Value::Array(ids)),
                 );
-                Box::pin(rel.model.find(Query::filter(f).with_count(false), ctx))
+                let related = if self.reveal_hidden {
+                    rel.model.clone()
+                } else {
+                    rel.model.public_view()
+                };
+                Box::pin(related.find(Query::filter(f).with_count(false), ctx))
                     .await?
                     .data
             };
@@ -1702,7 +1842,26 @@ impl Model {
     /// Hook and database errors.
     #[tracing::instrument(level = "debug", skip_all, fields(table = %self.inner.table))]
     pub async fn find(&self, q: Query, ctx: &Context) -> Result<FindResult> {
-        let filter = self.find_filter(&q, ctx).await?;
+        self.find_impl(q, None, ctx).await
+    }
+
+    pub(crate) async fn find_item(
+        &self,
+        mut q: Query,
+        id: DbValue,
+        ctx: &Context,
+    ) -> Result<FindResult> {
+        q.limit = Some(1);
+        q.count = Some(false);
+        self.find_impl(q, Some(id), ctx).await
+    }
+
+    async fn find_impl(&self, q: Query, id: Option<DbValue>, ctx: &Context) -> Result<FindResult> {
+        let item = id.is_some();
+        let mut filter = self.find_filter(&q, ctx).await?;
+        if let Some(id) = id {
+            filter = filter.and(self.pk(), Operator::Eq, id);
+        }
         let need_count = q.count.unwrap_or(q.limit.is_none());
         let mut res = self
             .db
@@ -1718,6 +1877,9 @@ impl Model {
                 },
             )
             .await?;
+        if item && res.data.is_empty() {
+            return Ok(res);
+        }
         res.data = self
             .finish_rows(std::mem::take(&mut res.data), &q, ctx)
             .await?;

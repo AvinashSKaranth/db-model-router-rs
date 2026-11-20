@@ -142,7 +142,8 @@ The spec covers only enabled operations, omits hidden columns, and documents
 ## Context in hooks
 
 Router-built `Context`: `ctx.user` = `CurrentUser` JSON (or `null`), `ctx.scope` = the
-`Scope` map (or empty), `ctx.request` = `{method, path, params, query, headers, body}`,
+`Scope` map (or empty), `ctx.request` = `{method, path, params, query, headers, body}`
+with authorization, proxy-authorization, cookie, and API-key headers omitted,
 `ctx.system` = `false`.
 
 ## Errors

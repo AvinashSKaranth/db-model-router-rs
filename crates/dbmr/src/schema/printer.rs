@@ -49,6 +49,10 @@ pub fn print_schema(schema: &Schema) -> String {
             }
         }
 
+        if let Some(scope) = &table.require_scope {
+            table_def.insert("require_scope".to_string(), json!(scope));
+        }
+
         if let Some(p) = &table.parent {
             table_def.insert("parent".to_string(), json!(p));
         } else {

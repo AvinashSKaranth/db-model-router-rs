@@ -1,6 +1,6 @@
 ---
 name: dbmr
-description: Build Rust services on dbmr (db-model-router-rs) - database-agnostic models with validation, hooks, row-level scopes (tenant/owner/parent permissions), soft delete, hidden columns, optimistic locking, timestamps, relations/includes, typed models, encryption, transactions and change events, plus generated Axum REST routers with route options, OpenAPI and health routes. Use whenever code imports `dbmr`, `dbmr_core`, `dbmr_http`, `dbmr_adapters` or `dbmr_kafka`, calls `Model::builder` or `create_model_router`, or the user asks to add a REST resource, CRUD endpoint, model, tenant isolation, per-user permissions, nested route, read-only resource, soft delete, password/hidden column, version/ETag locking, include, encrypted column or Kafka change events in a dbmr project - even if they don't name the library.
+description: Build Rust services on dbmr (db-model-router-rs) - database-agnostic models with validation, hooks, row-level scopes (tenant/owner/parent permissions), soft delete, hidden columns, optimistic locking, timestamps, relations/includes, typed models, encryption, transactions and change events, plus generated Axum REST routers with route options, OpenAPI and health routes. Use whenever code imports `dbmr`, calls `Model::builder` or `create_model_router`, or the user asks to add a REST resource, CRUD endpoint, model, tenant isolation, per-user permissions, nested route, read-only resource, soft delete, password/hidden column, version/ETag locking, include, encrypted column or Kafka change events in a dbmr project - even if they don't name the library.
 ---
 
 # dbmr
@@ -30,52 +30,40 @@ Library only. **No migrations, no CLI. The app creates its tables.**
 4. Write the auth middleware that inserts `CurrentUser` and `Scope`; layer it over the routes.
 5. Test with `tower::ServiceExt::oneshot` (see `references/examples.md` §23).
 
-## Minimal app (mirrors `crates/dbmr/examples/quickstart.rs`, which is compiled)
+## Scoped resource
+
+Start from the compiled [quickstart](../../crates/dbmr/examples/quickstart.rs). It
+includes SQLite DDL, a tenant index, a scope check, and a test with two identities.
+Run `cargo run -p dbmr --example quickstart` in the dbmr checkout.
+
+Use the authenticated principal from your existing session or token verifier.
+Resolve tenant membership on the server and pass it to the scope layer:
 
 ```rust
-use axum::{extract::Request, http::StatusCode, middleware::{self, Next}, response::Response, Router};
-use dbmr::adapters::SqliteAdapter;
-use dbmr::{create_model_router, CurrentUser, DatabaseAdapter, Model, Scope};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+use dbmr::{CurrentUser, Scope};
 use serde_json::json;
 
-async fn auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    // Real apps verify a session cookie or JWT here.
-    let tenant = req.headers().get("x-tenant").and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?.to_string();
-    req.extensions_mut().insert(CurrentUser(json!({ "tenant_id": tenant })));
-    req.extensions_mut().insert(Scope::new([("tenant_id", json!(tenant))]));
+// App-owned type. Only your authentication middleware inserts it after verification.
+#[derive(Clone)]
+struct VerifiedIdentity {
+    user_id: String,
+    tenant_id: String,
+}
+
+async fn scope(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+    let identity = req.extensions().get::<VerifiedIdentity>().cloned()
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    req.extensions_mut().insert(CurrentUser(json!({"id": identity.user_id})));
+    req.extensions_mut().insert(Scope::new([("tenant_id", identity.tenant_id)]));
     Ok(next.run(req).await)
 }
-
-#[tokio::main]
-async fn main() -> dbmr::Result<()> {
-    let db = SqliteAdapter::connect("sqlite://app.db").await?;   // already Arc<SqliteAdapter>
-    db.query("CREATE TABLE IF NOT EXISTS notes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
-        title TEXT NOT NULL, body TEXT, is_deleted INTEGER NOT NULL DEFAULT 0,
-        version INTEGER NOT NULL DEFAULT 1, created_at TEXT, updated_at TEXT)", &[]).await?;
-
-    let notes = Model::builder(db, "notes")
-        .column("id", "integer")
-        .column("tenant_id", "required|string")
-        .column("title", "required|string|maxLength:100")
-        .column("body", "string|nullable")
-        .safe_delete("is_deleted")
-        .version_column("version")
-        .created_at("created_at")
-        .modified_at("updated_at")
-        .search_columns(["title", "body"])
-        .require_scope(["tenant_id"])        // no tenant in the scope -> 401
-        .build()?;
-
-    let app = Router::new()
-        .nest("/notes", create_model_router(notes))
-        .layer(middleware::from_fn(auth));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.expect("bind");
-    axum::serve(listener, app).await.expect("serve");
-    Ok(())
-}
 ```
+
+Declare the scope column in the model and call `.require_scope(["tenant_id"])`.
+Mount with `create_model_router_with`. Start with `RouterOptions::read_only()`,
+set `export: false` for JSON-only endpoints, and enable only the requested writes.
+Run the authentication layer before the scope layer.
 
 Cargo: `dbmr = "0.0.1"` (or `dbmr = { version = "0.0.1", features = ["postgres"] }`, default `sqlite`), `axum = "0.8"`,
 `tokio = { version = "1", features = ["full"] }`, `serde_json = "1"`.
@@ -88,7 +76,7 @@ Cargo: `dbmr = "0.0.1"` (or `dbmr = { version = "0.0.1", features = ["postgres"]
 | `/:resource` | `POST` | Individual | `{ "name": "Alice" }` | `{ "id": 1, "name": "Alice", ... }` | Single create returns record |
 | `/:resource` | `POST` | Bulk | `{"data": [{ "name": "Alice" }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk insert summary |
 | `/:resource` | `PUT` | Bulk | `{"data": [{ "id": 1, ... }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk update summary |
-| `/:resource` | `DELETE` | Bulk | Filter criteria object | `{"rows": n, "message": "...", "type": "success"}` | Requires `.allow_destructive(true)` |
+| `/:resource` | `DELETE` | Bulk | Filter criteria object | `{"rows": n, "message": "...", "type": "success"}` | A matching filter is required |
 | `/:resource/:id` | `GET` | Individual | None | `{ "id": 1, ... }` | Exact literal PK equality |
 | `/:resource/:id` | `PUT` | Individual | `{ "name": "Alice Updated" }` | `{ "id": 1, ... }` | Replace record (preserves PK) |
 | `/:resource/:id` | `PATCH` | Individual | `{ "name": "Alice" }` | `{ "id": 1, ... }` | Partial update record |

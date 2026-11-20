@@ -13,10 +13,11 @@ is part of the product, and this protocol qualifies it.
 | Element | Definition |
 |---|---|
 | Subject | One LLM agent configuration (model + tool settings). Record the exact model ID |
-| Context given (arm **D**, docs) | `AGENTS.md`, `README.md`, `crates/dbmr/examples/quickstart.rs` (harness default) |
-| Control arm **R** (README only) | `--context README.md`. Measures what `AGENTS.md` and the example add |
+| Context given (arm **D**, skill) | `skills/dbmr/SKILL.md`, the compiled quickstart, and the HTTP reference (harness default) |
+| Control arm **R** (README only) | `--context README.md`. Measures what the skill and examples add |
+| Control arm **S** (plain Axum + SQLx) | `--backend sqlx`. Same HTTP acceptance tests and data effects, with SQLx pool and error types in the Rust signatures |
 | Withheld | The source tree, the tests and the reference solutions. The agent must not have repository access |
-| Output | The complete `src/lib.rs` of a crate `app` with fixed dependencies (dbmr/SQLite, axum 0.8, tokio, serde_json) |
+| Output | The complete `src/lib.rs` of a crate `app` with fixed dependencies (dbmr or SQLx with SQLite, axum 0.8, tokio, serde_json) |
 | Repair loop | Up to 3 attempts. After a failure, the agent receives the tail of the `cargo test` output |
 | Runs | 3 independent runs per task per arm (LLM output is nondeterministic) |
 | Oracle | The hidden acceptance test `oq-e/acceptance/E*.rs`. The harness copies it in; the agent never sees it |
@@ -40,7 +41,8 @@ Reported per arm:
 - `score_pct` (mean of points / 10);
 - green runs / total runs;
 - first-attempt compile rate;
-- the median number of attempts to green.
+- total input and output tokens, including retries and cached input, when the provider reports usage;
+- total tokens divided by passing apps, and wall time for generation plus acceptance checks.
 
 **Acceptance criteria (arm D):**
 - `score_pct` ≥ **80**;
@@ -73,15 +75,19 @@ A recurring class (a) or (b) error is a documentation defect: fix `AGENTS.md` or
 # 1. Harness self-test: must be 5/5 green
 PYTHONUTF8=1 python OQ/oq-e/run_oq_e.py --reference
 # 2. Arm D
-PYTHONUTF8=1 python OQ/oq-e/run_oq_e.py --runs 3 --out OQ/oq-e/results-D.json \
-  --agent-cmd 'claude -p "$(cat {prompt})" --model <model-id> > {out}'
+python OQ/oq-e/run_oq_e.py --runs 3 --out OQ/oq-e/results-D.json \
+  --agent-stdin --agent-output claude-json \
+  --agent-cmd 'claude -p --output-format json --tools="" --strict-mcp-config --no-session-persistence --model <model-id>'
 # 3. Arm R
-PYTHONUTF8=1 python OQ/oq-e/run_oq_e.py --runs 3 --context README.md --out OQ/oq-e/results-R.json \
-  --agent-cmd 'claude -p "$(cat {prompt})" --model <model-id> > {out}'
+python OQ/oq-e/run_oq_e.py --runs 3 --context README.md --out OQ/oq-e/results-R.json \
+  --agent-stdin --agent-output claude-json \
+  --agent-cmd 'claude -p --output-format json --tools="" --strict-mcp-config --no-session-persistence --model <model-id>'
+# 4. Arm S: repeat with --backend sqlx instead of --context README.md.
 ```
 
 Run the agent with no tools or file access (plain completion), so the docs are its only
-source.
+source. Tokens remain absent from the report for plain-text commands or incomplete usage
+data. Record the provider and exact model ID with each comparison.
 
 **Harness validation, executed 2026-11-14:**
 - `--reference` scored 5/5 green, 100%. This shows the tasks are solvable with the

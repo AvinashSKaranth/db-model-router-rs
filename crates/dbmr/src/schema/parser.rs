@@ -74,6 +74,12 @@ pub fn parse_schema(input: &str) -> Result<Schema, SchemaValidationError> {
                     .collect()
             });
             let version = table_val["version"].as_str().map(ToString::to_string);
+            let require_scope = table_val["require_scope"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            });
 
             let search_columns = table_val["search_columns"].as_array().map(|arr| {
                 arr.iter()
@@ -106,7 +112,7 @@ pub fn parse_schema(input: &str) -> Result<Schema, SchemaValidationError> {
                     timestamps,
                     hidden,
                     version,
-                    require_scope: None,
+                    require_scope,
                 },
             );
         }

@@ -51,7 +51,7 @@ Following crate consolidation, all library modules live in `crates/dbmr/src/`:
 
 - **Full Feature Tour**: [`crates/dbmr/examples/tour.rs`](file:///C:/Workspace/eForge/db-model-router-rs/crates/dbmr/examples/tour.rs) (`cargo run -p dbmr --example tour`)
 - **Quickstart**: [`crates/dbmr/examples/quickstart.rs`](file:///C:/Workspace/eForge/db-model-router-rs/crates/dbmr/examples/quickstart.rs)
-- **Blog Application Backend**: [`crates/dbmr/examples/blog_app.rs`](file:///C:/Workspace/eForge/db-model-router-rs/crates/dbmr/examples/blog_app.rs)
+- **Blog Application Modular Project**: [`crates/dbmr/examples/blog_app/`](file:///C:/Workspace/eForge/db-model-router-rs/crates/dbmr/examples/blog_app/) (`cargo run -p dbmr --example blog_app`)
 
 ---
 

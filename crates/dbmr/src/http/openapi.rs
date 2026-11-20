@@ -51,7 +51,8 @@ pub fn openapi(title: &str, version: &str, resources: &[(&str, &Model, &RouterOp
                 "message": {"type": "string"},
                 "type": {"type": "string", "const": "success"},
                 "id": {}
-            }
+            },
+            "additionalProperties": false
         }),
     );
     for (mount, model, opts) in resources {
@@ -354,7 +355,13 @@ fn collection_ops(
             (true, true) => {
                 let body = json_body(json!({
                     "oneOf": [
-                        single_ref,
+                        {
+                            "allOf": [single_ref],
+                            "not": {
+                                "required": ["data"],
+                                "properties": {"data": {"type": "array"}}
+                            }
+                        },
                         bulk_obj
                     ]
                 }));
@@ -365,16 +372,11 @@ fn collection_ops(
                             "application/json": {
                                 "schema": {
                                     "oneOf": [
-                                        schema_ref(name),
                                         json!({
-                                            "type": "object",
-                                            "properties": {
-                                                "rows": {"type": "integer"},
-                                                "message": {"type": "string"},
-                                                "type": {"type": "string", "example": "success"}
-                                            },
-                                            "required": ["rows", "message", "type"]
-                                        })
+                                            "allOf": [schema_ref(name)],
+                                            "not": schema_ref("BulkSummary")
+                                        }),
+                                        schema_ref("BulkSummary")
                                     ]
                                 }
                             }

@@ -30,6 +30,7 @@ struct State {
     rows: Mutex<Vec<RowMap>>,
     queued: Mutex<VecDeque<Vec<RowMap>>>,
     filters: Mutex<Vec<FilterExpr>>,
+    update_filters: Mutex<Vec<FilterExpr>>,
     sorts: Mutex<Vec<Vec<SortKey>>>,
     writes: Mutex<Vec<Write>>,
     summary: Mutex<Option<WriteSummary>>,
@@ -197,6 +198,7 @@ impl DatabaseAdapter for Fake {
     ) -> Result<u64> {
         self.push_log(format!("update_where sd={safe_delete:?}"));
         self.0.filters.lock().unwrap().push(filter.clone());
+        self.0.update_filters.lock().unwrap().push(filter.clone());
         Ok(1)
     }
     async fn query(&self, sql: &str, _params: &[DbValue]) -> Result<Vec<RowMap>> {
@@ -211,6 +213,36 @@ impl DatabaseAdapter for Fake {
         self.push_log("BEGIN".into());
         Ok(Arc::new(self.clone()))
     }
+}
+
+#[tokio::test]
+async fn scoped_mutations_pass_scope_to_the_adapter_write() {
+    let fake = Fake::default();
+    fake.set_rows(vec![row([("id", 1.into()), ("tenant_id", "a".into())])]);
+    let model = Model::builder(fake.db(), "notes")
+        .column("id", "integer")
+        .column("tenant_id", "string")
+        .column("title", "string")
+        .require_scope(["tenant_id"])
+        .build()
+        .unwrap();
+    let ctx = Context::new().with_scope([("tenant_id", "a")]);
+    let change = row([("id", 1.into()), ("title", "updated".into())]);
+
+    model.update(change.clone(), &ctx).await.unwrap();
+    model.update_many(vec![change.clone()], &ctx).await.unwrap();
+    model.upsert(change.clone(), &ctx).await.unwrap();
+    model.patch(change, &ctx).await.unwrap();
+
+    let log = fake.log();
+    let writes: Vec<_> = log
+        .iter()
+        .filter(|entry| entry.starts_with("update_where"))
+        .collect();
+    assert_eq!(writes.len(), 4);
+    assert!(!log.iter().any(|entry| entry == "upsert"));
+    let expected = FilterExpr::eq("id", 1).and("tenant_id", Operator::Eq, "a");
+    assert_eq!(*fake.0.update_filters.lock().unwrap(), vec![expected; 4]);
 }
 
 #[async_trait]
