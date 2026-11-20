@@ -1,5 +1,9 @@
 # dbmr (`db-model-router-rs`)
 
+[![Crates.io](https://img.shields.io/crates/v/db-model-router.svg)](https://crates.io/crates/db-model-router)
+[![Docs.rs](https://docs.rs/db-model-router/badge.svg)](https://docs.rs/db-model-router)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Database-agnostic **models** and generated **Axum REST routers** for Rust services. This is
 the Rust rewrite of the Node.js `db-model-router`. HTTP behaviour matches Node except for
 the deviations listed in [`docs/deviations.md`](docs/deviations.md).
@@ -41,7 +45,7 @@ SQLite, PostgreSQL, MySQL, MSSQL and Oracle (default 10 / 0 / 30 s). DynamoDB:
 
 ```toml
 [dependencies]
-dbmr = { path = "crates/dbmr" }            # features: sqlite (default), postgres, mysql, ...
+db-model-router = "0.0.1"            # features: sqlite (default), postgres, mysql, ...
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"

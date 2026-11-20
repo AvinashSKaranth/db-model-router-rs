@@ -5,7 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+description = "Multi-database adapters (SQLite, PostgreSQL, MySQL, MSSQL, Oracle, Mongo, Redis, DynamoDB) for dbmr"
+readme = "README.md"
+repository.workspace = true
+keywords = ["database", "sql", "postgres", "sqlite", "mysql"]
+categories = ["database"]
+
+[package.metadata.docs.rs]
+features = ["sqlite", "postgres", "mysql", "mongodb", "redis"]
+no-default-features = true
 
 [features]
 default = ["sqlite"]

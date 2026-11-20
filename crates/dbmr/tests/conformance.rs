@@ -877,6 +877,7 @@ fn ddl(
 }
 
 /// Drop then create, so a schema change never meets a stale table.
+#[allow(dead_code)]
 async fn recreate(db: &dyn DatabaseAdapter, drop: &str, create: &str) {
     db.query(drop, &[]).await.unwrap();
     db.query(create, &[]).await.unwrap();

@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+description = "Kafka change event sink and CDC producer for dbmr"
+readme = "README.md"
+repository.workspace = true
+keywords = ["kafka", "cdc", "events", "database"]
+categories = ["database"]
 
 [dependencies]
 async-trait.workspace = true

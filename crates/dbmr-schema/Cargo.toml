@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+description = "Schema parsing, validation, and metadata generation for dbmr"
+readme = "README.md"
+repository.workspace = true
+keywords = ["schema", "database", "validation", "orm"]
+categories = ["database"]
 
 [dependencies]
 dbmr-core.workspace = true

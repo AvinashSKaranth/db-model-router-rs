@@ -851,8 +851,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "dbmr"
-version = "0.1.0"
+name = "db-model-router"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-adapters"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-bench"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "compact_str",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-http"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "bytes",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-kafka"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "dbmr-schema"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "compact_str",
  "dbmr-core",
@@ -4659,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "serde",

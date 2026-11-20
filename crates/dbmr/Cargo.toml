@@ -1,5 +1,5 @@
 [package]
-name = "dbmr"
+name = "db-model-router"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,16 @@ license.workspace = true
 authors.workspace = true
 description = "Database-agnostic data modeling and custom routers for Rust web services"
 readme = "README.md"
-repository = "https://github.com/eForge/db-model-router-rs"
+repository.workspace = true
 keywords = ["orm", "database", "router", "axum", "rest"]
 categories = ["web-programming::http-server", "database"]
+
+[lib]
+name = "dbmr"
+
+[package.metadata.docs.rs]
+features = ["sqlite", "postgres", "mysql", "mongodb", "redis"]
+no-default-features = true
 
 
 [features]

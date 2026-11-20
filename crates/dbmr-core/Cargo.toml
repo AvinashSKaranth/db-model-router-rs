@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+description = "Core model operations, row types, validation, hooks, and query AST for dbmr"
+readme = "README.md"
+repository.workspace = true
+keywords = ["orm", "database", "model", "validation", "query"]
+categories = ["database"]
 
 [dependencies]
 serde.workspace = true

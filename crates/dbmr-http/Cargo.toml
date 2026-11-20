@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-publish = false
+description = "Axum REST router generator with row scopes, OpenAPI, and ETag locking for dbmr"
+readme = "README.md"
+repository.workspace = true
+keywords = ["axum", "router", "rest", "http", "openapi"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 dbmr-core.workspace = true
