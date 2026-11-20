@@ -851,7 +851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "db-model-router"
+name = "dbmr"
 version = "0.0.1"
 dependencies = [
  "aes-gcm",
@@ -893,7 +893,7 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "compact_str",
- "db-model-router",
+ "dbmr",
  "indexmap",
  "rand 0.8.8",
  "rust_decimal",

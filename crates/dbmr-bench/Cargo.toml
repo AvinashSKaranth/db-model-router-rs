@@ -12,7 +12,7 @@ name = "dbmr-bench"
 path = "src/main.rs"
 
 [dependencies]
-dbmr = { package = "db-model-router", path = "../dbmr", features = ["sqlite", "postgres"] }
+dbmr = { path = "../dbmr", features = ["sqlite", "postgres"] }
 tokio = { workspace = true, features = ["full"] }
 sqlx = { workspace = true, features = ["sqlite", "postgres"] }
 indexmap.workspace = true

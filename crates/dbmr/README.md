@@ -1,10 +1,10 @@
-# db-model-router (`dbmr`)
+# dbmr
 
 Database-agnostic **models** and generated **Axum REST routers** for Rust services.
 Rewrite of the Node.js `db-model-router` with high-performance async Rust and complete feature parity.
 
-[![Crates.io](https://img.shields.io/crates/v/db-model-router.svg)](https://crates.io/crates/db-model-router)
-[![Docs.rs](https://docs.rs/db-model-router/badge.svg)](https://docs.rs/db-model-router)
+[![Crates.io](https://img.shields.io/crates/v/dbmr.svg)](https://crates.io/crates/dbmr)
+[![Docs.rs](https://docs.rs/dbmr/badge.svg)](https://docs.rs/dbmr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-db-model-router = "0.0.1"        # features: sqlite (default), postgres, mysql, etc.
+dbmr = "0.0.1"        # features: sqlite (default), postgres, mysql, etc.
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"

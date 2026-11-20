@@ -1,5 +1,5 @@
 [package]
-name = "db-model-router"
+name = "dbmr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
