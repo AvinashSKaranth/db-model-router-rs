@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs every quality check and refreshes docs/report.html. Blocks the push when a gate
+# fails (fmt, clippy, tests, cargo-deny, cargo-audit, static lints, gitleaks,
+# traceability, rustdoc). Coverage below target is reported, not blocking.
+# Live-service tests are mandatory: every docker-compose service must be up.
+# Bypass in an emergency: git push --no-verify
+cd "$(git rev-parse --show-toplevel)" || exit 1
+# First interpreter that really runs (skips the Windows Store python3 stub).
+for PY in python3 python py; do "$PY" -c "" 2>/dev/null && break; PY=; done
+[ -n "$PY" ] || { echo "pre-push: no working python found" >&2; exit 1; }
+PYTHONUTF8=1 "$PY" scripts/report.py
+status=$?
+if [ $status -ne 0 ]; then
+  echo "pre-push: quality gate failed, push blocked. See docs/report.html" >&2
+fi
+exit $status

@@ -1,0 +1,92 @@
+[package]
+name = "dbmr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Database-agnostic data modeling and custom routers for Rust web services"
+readme = "README.md"
+repository.workspace = true
+keywords = ["orm", "database", "router", "axum", "rest"]
+categories = ["web-programming::http-server", "database"]
+
+[lib]
+name = "dbmr"
+
+[package.metadata.docs.rs]
+features = ["sqlite", "postgres", "mysql", "mongodb", "redis"]
+no-default-features = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+postgres = ["dep:sqlx", "sqlx/postgres"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
+mariadb = ["mysql"]
+cockroachdb = ["postgres"]
+mssql = ["dep:tiberius", "dep:tokio-util"]
+oracle = ["dep:oracle-rs"]
+mongodb = ["dep:mongodb"]
+redis = ["dep:redis"]
+dynamodb = ["dep:reqwest"]
+kafka = ["dep:rskafka"]
+testing = []
+
+[dependencies]
+# Serialization & Core types
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+compact_str.workspace = true
+rust_decimal.workspace = true
+chrono.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+# Async & Runtime
+tokio.workspace = true
+async-trait.workspace = true
+arc-swap.workspace = true
+futures.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Cryptography & Security
+aes-gcm.workspace = true
+base64.workspace = true
+sha2.workspace = true
+rand.workspace = true
+
+# Web & HTTP
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+bytes.workspace = true
+
+# Database drivers (optional, behind features)
+sqlx = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
+tiberius = { workspace = true, optional = true, features = ["tds73"] }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
+oracle-rs = { version = "0.1.7", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+# Kafka (optional)
+rskafka = { version = "0.6.0", optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["full"] }
+sqlx = { workspace = true, features = ["sqlite"] }
+rskafka = "0.6.0"
+
+[[test]]
+name = "kafka_tests"
+required-features = ["kafka"]
+
+[lints]
+workspace = true

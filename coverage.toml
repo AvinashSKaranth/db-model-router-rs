@@ -1,0 +1,10 @@
+# cargo-llvm-cov configuration for db-model-router-rs
+
+[coverage]
+target-threshold = 95.0
+
+# Exclusions per BRD §12.3
+exclude = [
+    "crates/dbmr-bench/**",
+    "tests/**",
+]

@@ -1,0 +1,40 @@
+# cargo-deny configuration for db-model-router-rs
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA list data)
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+version = 2
+# cargo-deny >= 0.16: vulnerability/unsound/notice advisories always deny.
+yanked = "deny"
+# Accepted risks: no fixed version reachable through our direct dependencies.
+# Re-check on every sqlx / oracle-rs upgrade and drop entries once fixed upstream.
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30 pinned by sqlx 0.8; fix needs >= 0.39 (sqlx 0.9)" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack via sqlx-mysql; no fixed rsa release; client only RSA-encrypts the password (caching_sha2), Marvin targets decryption" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained, pulled by oracle-rs; no maintained alternative upstream yet" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (no vulnerability); pulled by sqlx, tiberius, oracle-rs and rskafka, so dropping our direct use would not remove it. Revisit when sqlx moves to jiff/time" },
+]
