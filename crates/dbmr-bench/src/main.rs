@@ -22,12 +22,12 @@
 )]
 
 use compact_str::CompactString;
-use dbmr_adapters::PostgresAdapter;
-use dbmr_core::adapter::DatabaseAdapter;
-use dbmr_core::filter::{Condition, FilterExpr, Operator};
-use dbmr_core::model::ModelInstance;
-use dbmr_core::types::{DbValue, RowMap};
-use dbmr_core::{Context, Query};
+use dbmr::adapters::PostgresAdapter;
+use dbmr::core::adapter::DatabaseAdapter;
+use dbmr::core::filter::{Condition, FilterExpr, Operator};
+use dbmr::core::model::ModelInstance;
+use dbmr::core::types::{DbValue, RowMap};
+use dbmr::{Context, Query};
 use indexmap::IndexMap;
 use rand::Rng;
 use rust_decimal::Decimal;

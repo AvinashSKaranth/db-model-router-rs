@@ -8,22 +8,21 @@
 //! - [`adapters`]: Multi-database adapters (`SQLite`, `PostgreSQL`, `MySQL`, etc.).
 //! - [`http`]: Custom Axum router generation with QUERY method support.
 
-pub use dbmr_adapters as adapters;
-pub use dbmr_core as core;
-pub use dbmr_http as http;
-pub use dbmr_schema as schema;
+pub mod adapters;
+pub mod core;
+pub mod http;
+pub mod schema;
 
-pub use dbmr_adapters::{DatabaseAdapter, TransactionAdapter};
-pub use dbmr_core::{
+#[cfg(feature = "kafka")]
+pub mod kafka;
+
+pub use adapters::{DatabaseAdapter, TransactionAdapter};
+pub use core::{
     AppError, Context, CurrentUser, DbValue, EncryptionConfig, Model, ModelHooks, Query, Result,
     RowMap, Scope, Transaction,
 };
-pub use dbmr_core::{Page, TypedModel};
-pub use dbmr_http::create_model_router;
-
-/// Kafka change-event producer (feature `kafka`).
-#[cfg(feature = "kafka")]
-pub use dbmr_kafka as kafka;
+pub use core::{Page, TypedModel};
+pub use http::create_model_router;
 
 use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock};
