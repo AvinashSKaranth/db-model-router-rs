@@ -447,6 +447,36 @@ fn validate_tables(
             }
         }
 
+        if let Some(scope_val) = table_obj.get("require_scope").filter(|v| !v.is_null()) {
+            match scope_val.as_array() {
+                Some(arr) => {
+                    for (i, col_val) in arr.iter().enumerate() {
+                        match col_val.as_str() {
+                            Some(col) if column_names.contains(col) => {}
+                            Some(col) => errors.push(ValidationError {
+                                path: format!("{base_path}.require_scope[{i}]"),
+                                message: format!(
+                                    "require_scope entry \"{col}\" does not exist in table \"{table_name}\""
+                                ),
+                            }),
+                            None => errors.push(ValidationError {
+                                path: format!("{base_path}.require_scope[{i}]"),
+                                message: format!(
+                                    "require_scope entry must be a string in table \"{table_name}\""
+                                ),
+                            }),
+                        }
+                    }
+                }
+                None => errors.push(ValidationError {
+                    path: format!("{base_path}.require_scope"),
+                    message: format!(
+                        "require_scope must be an array of strings in table \"{table_name}\""
+                    ),
+                }),
+            }
+        }
+
         // Validate parent
         if let Some(parent_val) = table_obj.get("parent") {
             if !parent_val.is_null() {

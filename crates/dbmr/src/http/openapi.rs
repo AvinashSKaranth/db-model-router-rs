@@ -337,17 +337,73 @@ fn collection_ops(
             ),
         );
     }
-    if o.bulk_create {
-        let b = bulk_body(schema_ref(&format!("{name}Create")));
-        ops.insert(
-            "post".into(),
-            op(
-                format!("Insert many {name}"),
-                &params,
-                Some(b),
-                responses(summary(), false),
-            ),
-        );
+    if o.create || o.bulk_create {
+        let single_ref = schema_ref(&format!("{name}Create"));
+        let bulk_obj = json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": single_ref.clone()
+                }
+            },
+            "required": ["data"]
+        });
+
+        let (b, op_title, resp) = match (o.create, o.bulk_create) {
+            (true, true) => {
+                let body = json_body(json!({
+                    "oneOf": [
+                        single_ref,
+                        bulk_obj
+                    ]
+                }));
+                let r = responses(
+                    json!({
+                        "description": "Success (single record or bulk summary)",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "oneOf": [
+                                        schema_ref(name),
+                                        json!({
+                                            "type": "object",
+                                            "properties": {
+                                                "rows": {"type": "integer"},
+                                                "message": {"type": "string"},
+                                                "type": {"type": "string", "example": "success"}
+                                            },
+                                            "required": ["rows", "message", "type"]
+                                        })
+                                    ]
+                                }
+                            }
+                        }
+                    }),
+                    false,
+                );
+                (body, format!("Insert one or many {name}"), r)
+            }
+            (true, false) => {
+                let body = json_body(single_ref);
+                (
+                    body,
+                    format!("Insert one {name}"),
+                    responses(ok(schema_ref(name), false), false),
+                )
+            }
+            (false, true) => {
+                let body = bulk_body(single_ref);
+                (
+                    body,
+                    format!("Insert many {name}"),
+                    responses(summary(), false),
+                )
+            }
+            (false, false) => unreachable!(),
+        };
+
+        ops.insert("post".into(), op(op_title, &params, Some(b), resp));
     }
     if o.bulk_update {
         let b = bulk_body(schema_ref(name));

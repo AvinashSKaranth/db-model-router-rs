@@ -185,4 +185,4 @@ let rec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 ```
 
 Use `SqliteAdapter::connect("sqlite::memory:")` in tests (kept on one connection). Patterns
-to copy: `crates/dbmr-http/tests/route_tests.rs`, `crates/dbmr-http/tests/router_features_tests.rs`.
+to copy: `crates/dbmr/tests/route_tests.rs`, `crates/dbmr/tests/router_features_tests.rs`.

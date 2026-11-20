@@ -255,6 +255,8 @@ async fn hidden_columns_are_not_writable_or_filterable() {
 
     for uri in [
         "/?password_hash=x",
+        "/?PASSWORD_HASH=x",
+        "/?%20password_hash%20=x",
         "/?password_hash=%25a%25",
         "/?sort=-password_hash",
         "/?select_columns=id,password_hash",
@@ -521,7 +523,19 @@ async fn openapi_document_follows_models_and_options() {
             "{code}"
         );
     }
-    let bulk = &paths["/accounts"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    let post_schema =
+        &paths["/accounts"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    let single = post_schema
+        .get("oneOf")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .unwrap_or(post_schema);
+    assert_eq!(single["$ref"], "#/components/schemas/accountsCreate");
+    let bulk = post_schema
+        .get("oneOf")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(1))
+        .unwrap_or(post_schema);
     assert_eq!(
         bulk["properties"]["data"]["items"]["$ref"],
         "#/components/schemas/accountsCreate"

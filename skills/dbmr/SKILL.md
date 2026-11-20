@@ -77,8 +77,22 @@ async fn main() -> dbmr::Result<()> {
 }
 ```
 
-Cargo: `dbmr = { path = "...", features = ["postgres"] }` (default `sqlite`), `axum = "0.8"`,
+Cargo: `dbmr = "0.0.1"` (or `dbmr = { version = "0.0.1", features = ["postgres"] }`, default `sqlite`), `axum = "0.8"`,
 `tokio = { version = "1", features = ["full"] }`, `serde_json = "1"`.
+
+## Endpoint Routing: Individual vs Bulk Routes
+
+| Route | Method | Mode | Request Payload | Response | Notes |
+|---|---|---|---|---|---|
+| `/:resource` | `GET` | Bulk | Query params (`?page=0&size=30`) | `{"data": [...], "count": total}` | Paged collection list |
+| `/:resource` | `POST` | Individual | `{ "name": "Alice" }` | `{ "id": 1, "name": "Alice", ... }` | Single create returns record |
+| `/:resource` | `POST` | Bulk | `{"data": [{ "name": "Alice" }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk insert summary |
+| `/:resource` | `PUT` | Bulk | `{"data": [{ "id": 1, ... }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk update summary |
+| `/:resource` | `DELETE` | Bulk | Filter criteria object | `{"rows": n, "message": "...", "type": "success"}` | Requires `.allow_destructive(true)` |
+| `/:resource/:id` | `GET` | Individual | None | `{ "id": 1, ... }` | Exact literal PK equality |
+| `/:resource/:id` | `PUT` | Individual | `{ "name": "Alice Updated" }` | `{ "id": 1, ... }` | Replace record (preserves PK) |
+| `/:resource/:id` | `PATCH` | Individual | `{ "name": "Alice" }` | `{ "id": 1, ... }` | Partial update record |
+| `/:resource/:id` | `DELETE` | Individual | None | `{"rows": 1, "message": "...", "type": "success"}` | Deletes at most 1 row |
 
 ## Rules generated code gets wrong
 
@@ -125,7 +139,7 @@ Cargo: `dbmr = { path = "...", features = ["postgres"] }` (default `sqlite`), `a
   read-only resources, includes, jobs, audit columns, Kafka, schema-driven app).
 
 Ground truth when this skill and the code disagree: `crates/dbmr/examples/tour.rs` (every
-feature, run with `cargo run -p dbmr --example tour`), `crates/dbmr-http/tests/scope_tests.rs`,
-`crates/dbmr-http/tests/route_tests.rs`, `crates/dbmr-http/tests/router_features_tests.rs`
+feature, run with `cargo run -p dbmr --example tour`), `crates/dbmr/tests/scope_tests.rs`,
+`crates/dbmr/tests/route_tests.rs`, `crates/dbmr/tests/router_features_tests.rs`
 (HTTP status/body) and `crates/dbmr/tests/model_contract.rs`, `crates/dbmr/tests/conformance.rs`
 (model behaviour). The code wins; report the mismatch.

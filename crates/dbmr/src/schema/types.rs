@@ -36,6 +36,9 @@ pub struct TableDef {
     /// Optimistic-lock column (`Model::version_column`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Require scope columns (`Model::require_scope`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_scope: Option<Vec<String>>,
 }
 
 fn default_id() -> String {
@@ -130,6 +133,8 @@ pub struct ModelMetaOption {
     pub hidden: Vec<String>,
     #[serde(default)]
     pub version: Option<String>,
+    #[serde(default)]
+    pub require_scope: Vec<String>,
 }
 
 /// Compiled column rule for runtime validation and execution.

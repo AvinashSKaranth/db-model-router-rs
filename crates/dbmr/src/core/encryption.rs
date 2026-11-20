@@ -20,11 +20,21 @@ static ENVELOPE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^enc:v(\d+):([A-Za-z0-9+/]+={0,2})$").unwrap()
 });
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EncryptionConfig {
     pub active_version: u32,
     pub active_key: [u8; 32],
     pub keyring: HashMap<u32, [u8; 32]>,
+}
+
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("active_version", &self.active_version)
+            .field("active_key", &"[REDACTED]")
+            .field("keyring_versions", &self.keyring.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl EncryptionConfig {
@@ -394,5 +404,15 @@ mod tests {
         assert_eq!(back["age"], 42);
         assert_eq!(back["ok"], true);
         assert_eq!(back["profile"]["dob"], "2000-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_debug_redaction() {
+        let cfg =
+            EncryptionConfig::new("raw:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 1, None)
+                .unwrap();
+        let debug_str = format!("{cfg:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 }

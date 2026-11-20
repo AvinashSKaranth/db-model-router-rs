@@ -1,7 +1,7 @@
 # dbmr
 
 Database-agnostic **models** and generated **Axum REST routers** for Rust services.
-Rewrite of the Node.js `db-model-router` with high-performance async Rust and complete feature parity.
+High-performance async Rust rewrite of the Node.js `db-model-router` with complete feature parity.
 
 [![Crates.io](https://img.shields.io/crates/v/dbmr.svg)](https://crates.io/crates/dbmr)
 [![Docs.rs](https://docs.rs/dbmr/badge.svg)](https://docs.rs/dbmr)
@@ -12,13 +12,15 @@ Rewrite of the Node.js `db-model-router` with high-performance async Rust and co
 - **10 Database Adapters**: SQLite, PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, Oracle, MongoDB, Redis, DynamoDB.
 - **Declarative Models**: Type validation, unique constraints, soft delete, auto timestamps, optimistic locking (ETag/If-Match), field encryption (AES-256-GCM).
 - **Row-Level Scopes**: Security first. Enforces tenant, owner, or parent permissions on every query and mutation.
-- **Generated Axum REST Routers**: Automatic list paging, filtering, searching, sorting, single & bulk CRUD, and OpenAPI generation.
+- **Generated Axum REST Routers**: Automatic list paging, filtering, searching, sorting, individual & bulk CRUD, and OpenAPI generation.
 - **Multi-Entity Relations**: `has_many` and `belongs_to` with eager loading via `?include=...`.
 - **Change Events**: Optional CDC stream to Kafka topics.
 
-## Installation
+---
 
-Add to your `Cargo.toml`:
+## Adding to Your Project
+
+Add `dbmr` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -34,6 +36,38 @@ In your Rust code, import via `dbmr`:
 use dbmr::adapters::SqliteAdapter;
 use dbmr::{create_model_router, Context, Model, Scope};
 ```
+
+---
+
+## Adding the Skill to Your AI Agent Workspace
+
+If you are using AI coding assistants (such as Claude Code, Cursor, GitHub Copilot, Antigravity, or other Agentic workflows), you can install the official `dbmr` agent skill directly into your workspace:
+
+```bash
+npx skills add https://github.com/AvinashSKaranth/db-model-router-rs --path skills/dbmr
+```
+
+This equips your AI agent with the complete API contract, security patterns, scope middleware implementations, and error-handling best practices for `dbmr`.
+
+---
+
+## Individual & Bulk Route Endpoints
+
+Every `create_model_router(model)` router automatically exposes both individual and bulk operations:
+
+| HTTP Method | Route | Type | Request Payload | Response |
+|---|---|---|---|---|
+| `GET` | `/resources` | Bulk | Query params (`?page=0&size=30&...`) | `{"data": [...], "count": total}` |
+| `POST` | `/resources` | Individual | `{ "title": "My Post" }` | Created record `{ "id": 1, ... }` |
+| `POST` | `/resources` | Bulk | `{"data": [{ "title": "P1" }, { "title": "P2" }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
+| `PUT` | `/resources` | Bulk | `{"data": [{ "id": 1, ... }, { "id": 2, ... }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
+| `DELETE` | `/resources` | Bulk | Filter criteria object (requires `.allow_destructive(true)`) | `{"rows": n, "message": "...", "type": "success"}` |
+| `GET` | `/resources/:id` | Individual | None | Single record `{ "id": 1, ... }` |
+| `PUT` | `/resources/:id` | Individual | `{ "title": "Updated" }` (full replace) | Updated record `{ "id": 1, ... }` |
+| `PATCH` | `/resources/:id` | Individual | `{ "title": "Partial update" }` | Updated record `{ "id": 1, ... }` |
+| `DELETE` | `/resources/:id` | Individual | None | `{"rows": 1, "message": "...", "type": "success"}` |
+
+---
 
 ## Quick Example
 
@@ -66,8 +100,10 @@ async fn main() -> dbmr::Result<()> {
 }
 ```
 
+---
+
 ## Documentation & Examples
 
-- [Feature Tour](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/tour.rs)
-- [Blog App Example](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/blog_app.rs)
-- [Full Documentation](https://docs.rs/db-model-router)
+- [Blog App Example (Authors, Posts, Comments, Likes, Shares)](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/blog_app.rs)
+- [Complete Feature Tour](https://github.com/AvinashSKaranth/db-model-router-rs/blob/master/crates/dbmr/examples/tour.rs)
+- [API Reference on Docs.rs](https://docs.rs/dbmr)

@@ -147,6 +147,7 @@ fn print_sorts_relationships_and_omits_empty_parts() {
             timestamps: None,
             hidden: None,
             version: None,
+            require_scope: None,
         },
     );
     let mut s = Schema {
@@ -217,6 +218,7 @@ fn model_meta_skips_required_auto_increment_and_defaults_missing_parts() {
             timestamps: None,
             hidden: None,
             version: None,
+            require_scope: None,
         },
     );
     let s = Schema {

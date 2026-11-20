@@ -304,6 +304,15 @@ async fn require_scope_fails_closed_and_system_opts_out() {
     let (st, _) = call(&app, "POST", "/notes", "", json!({"title": "x"})).await;
     assert_eq!(st, 401);
 
+    // Undeclared require_scope column fails at build time
+    let res = notes(db().await)
+        .require_scope(["non_existent_tenant_column"])
+        .build();
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.status_code(), 422);
+    assert!(err.message().contains("not declared in model structure"));
+
     // Jobs: an unscoped Context is refused; Context::system() is the explicit opt-out.
     let row = json_to_row(&json!({"tenant_id": "a", "title": "job"}));
     let e = m.insert(row.clone(), &Context::new()).await.unwrap_err();

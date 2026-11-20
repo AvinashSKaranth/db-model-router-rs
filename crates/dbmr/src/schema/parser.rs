@@ -106,6 +106,7 @@ pub fn parse_schema(input: &str) -> Result<Schema, SchemaValidationError> {
                     timestamps,
                     hidden,
                     version,
+                    require_scope: None,
                 },
             );
         }

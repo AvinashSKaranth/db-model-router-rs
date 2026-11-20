@@ -322,6 +322,14 @@ impl ModelBuilder {
                 self.table
             )));
         }
+        for req_col in &self.options.require_scope {
+            if !self.structure.contains_key(req_col.as_str()) {
+                return Err(AppError::Validation(format!(
+                    "require_scope column \"{req_col}\" is not declared in model structure for table \"{}\"",
+                    self.table
+                )));
+            }
+        }
         let defaults = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         let strip_keys = self
             .options
@@ -771,6 +779,7 @@ impl Model {
         summary: &WriteSummary,
         payload_pk: Option<DbValue>,
         safe_delete: Option<&str>,
+        scope: &FilterExpr,
     ) -> Result<Option<RowMap>> {
         if let Some(rec) = &summary.record {
             return Ok(Some(rec.clone()));
@@ -781,7 +790,10 @@ impl Model {
             .filter(|v| !v.is_null() && *v != DbValue::Int(0))
             .or(payload_pk.filter(|v| !v.is_null()));
         match id {
-            Some(id) => self.get_one(&self.pk_filter(id), safe_delete).await,
+            Some(id) => {
+                self.get_one(&self.pk_filter(id).and_expr(scope), safe_delete)
+                    .await
+            }
             None => Ok(None),
         }
     }
@@ -805,13 +817,14 @@ impl Model {
     }
 
     async fn write_one(&self, row: RowMap, op: BulkOp, ctx: &Context) -> Result<Option<RowMap>> {
+        let scope = self.scope(ctx)?;
         let (rows, _) = self.prepare(vec![row], op, false, ctx).await?;
         if self.version_col().is_some() && op != BulkOp::Insert {
             let row = rows.into_iter().next().unwrap_or_default();
-            let Some(key) = self.locked_write(row, op).await? else {
+            let Some(key) = self.locked_write(row, op, &scope).await? else {
                 return Ok(None);
             };
-            let Some(mut rec) = self.get_one(&key, None).await? else {
+            let Some(mut rec) = self.get_one(&key.clone().and_expr(&scope), None).await? else {
                 return Ok(None);
             };
             self.decode(&mut rec)?;
@@ -840,7 +853,10 @@ impl Model {
         } else {
             self.safe_delete()
         };
-        let Some(mut rec) = self.resolve_record(&summary, payload_pk, sd).await? else {
+        let Some(mut rec) = self
+            .resolve_record(&summary, payload_pk, sd, &scope)
+            .await?
+        else {
             tracing::warn!(
                 "[db-model-router] {} on {} succeeded but the record could not be re-fetched",
                 op_name(op),
@@ -883,7 +899,12 @@ impl Model {
     /// version = v + 1 WHERE key AND version = v`. Returns the filter that finds the row
     /// again, or `None` when an update targets no row. `409` when the row exists with a
     /// different version, `428` when the version is missing for an existing row.
-    async fn locked_write(&self, mut row: RowMap, op: BulkOp) -> Result<Option<FilterExpr>> {
+    async fn locked_write(
+        &self,
+        mut row: RowMap,
+        op: BulkOp,
+        scope: &FilterExpr,
+    ) -> Result<Option<FilterExpr>> {
         let vc = self.version_col().unwrap_or_default().to_string();
         let version = row.shift_remove(vc.as_str()).filter(|v| !v.is_null());
         let key_cols: Vec<String> = if op == BulkOp::Update {
@@ -909,8 +930,9 @@ impl Model {
             _ => return self.locked_insert(row, None).await.map(Some),
         };
         let sd = self.safe_delete();
+        let scoped_key = key.clone().and_expr(scope);
         let Some(v) = version else {
-            if op == BulkOp::Update || self.get_one(&key, sd).await?.is_some() {
+            if op == BulkOp::Update || self.get_one(&scoped_key, sd).await?.is_some() {
                 return Err(AppError::PreconditionRequired(
                     VERSION_REQUIRED_MESSAGE.into(),
                 ));
@@ -923,7 +945,7 @@ impl Model {
             set.shift_remove(c.as_str());
         }
         set.insert(CompactString::new(&vc), DbValue::Int(v + 1));
-        let guarded = key.clone().and(&vc, Operator::Eq, DbValue::Int(v));
+        let guarded = scoped_key.and(&vc, Operator::Eq, DbValue::Int(v));
         if self
             .db
             .update_where(self.table_name(), &set, &guarded, sd)
@@ -932,7 +954,7 @@ impl Model {
         {
             return Ok(Some(key));
         }
-        match self.get_one(&key, sd).await? {
+        match self.get_one(&key.clone().and_expr(scope), sd).await? {
             Some(_) => Err(AppError::Conflict(CONFLICT_MESSAGE.into())),
             None if op == BulkOp::Upsert => self.locked_insert(row, Some(key)).await.map(Some),
             None => Ok(None),
@@ -968,10 +990,11 @@ impl Model {
             self.conceal(r);
         }
         if self.version_col().is_some() && op != BulkOp::Insert {
+            let scope = self.scope(ctx)?;
             // ponytail: one statement per row; wrap in a Transaction for all-or-nothing.
             let mut n = 0u64;
             for (i, row) in rows.into_iter().enumerate() {
-                match self.locked_write(row, op).await {
+                match self.locked_write(row, op, &scope).await {
                     Ok(Some(_)) => n += 1,
                     Ok(None) => {}
                     Err(e) => return Err(prefix_error(&e, &format!("data.{i}: "))),

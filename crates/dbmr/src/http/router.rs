@@ -43,10 +43,11 @@
 #![allow(clippy::result_large_err)]
 
 use crate::core::error::AppError;
+use crate::core::filter::{FilterExpr, Operator};
 use crate::core::hooks::{Context, CurrentUser, Scope};
 use crate::core::model::Model;
 use crate::core::query::Query;
-use crate::core::types::{json_to_row, row_to_json, RowMap, WriteSummary};
+use crate::core::types::{json_to_row, row_to_json, DbValue, RowMap, WriteSummary};
 use crate::core::{data_to_filter, json_safe_parse, CONFLICT_MESSAGE};
 use crate::http::formatter::{format_csv, format_xml};
 use axum::extract::{Path, Request, State};
@@ -431,12 +432,11 @@ fn data_array(body: &Value) -> Option<&Value> {
 
 /// Remove hidden columns from an object, each array item, and each `data` item.
 fn strip_hidden(v: &mut Value, hidden: &[String]) {
+    let hidden_lower: Vec<String> = hidden.iter().map(|s| s.trim().to_lowercase()).collect();
     match v {
         Value::Array(a) => a.iter_mut().for_each(|x| strip_hidden(x, hidden)),
         Value::Object(o) => {
-            for c in hidden {
-                o.remove(c);
-            }
+            o.retain(|k, _| !hidden_lower.contains(&k.trim().to_lowercase()));
             if let Some(d) = o.get_mut("data").filter(|d| d.is_array()) {
                 strip_hidden(d, hidden);
             }
@@ -447,8 +447,14 @@ fn strip_hidden(v: &mut Value, hidden: &[String]) {
 
 /// True when a client column reference names a hidden column.
 fn touches_hidden(st: &ModelRouterState, cols: impl IntoIterator<Item = String>) -> bool {
-    let hidden = st.model.hidden_columns();
-    cols.into_iter().any(|c| hidden.contains(&c))
+    let hidden: Vec<String> = st
+        .model
+        .hidden_columns()
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+    cols.into_iter()
+        .any(|c| hidden.contains(&c.trim().to_lowercase()))
 }
 
 /// Parse a read payload; hidden columns are `422`, a disabled export is `400`.
@@ -590,13 +596,21 @@ async fn item_inner(
             "Bulk writes ({\"data\": [...]}) use the collection route",
         ));
     }
-    let id = Value::String(req.id.clone().unwrap_or_default());
-    let pk = m.pk().to_string();
-    let with_pk = |mut v: Value| {
-        if let Value::Object(o) = &mut v {
-            o.insert(pk.clone(), id.clone());
+    let id_raw = req.id.clone().unwrap_or_default();
+    let pk_name = m.pk();
+    let pk_rule = m.structure().get(pk_name).map_or("string", String::as_str);
+    let pk_literal: DbValue = if pk_rule.starts_with("int") || pk_rule == "auto_increment" {
+        match id_raw.parse::<i128>() {
+            Ok(n) => DbValue::Int(n),
+            Err(_) => DbValue::Text(id_raw.clone()),
         }
-        v
+    } else {
+        DbValue::Text(id_raw.clone())
+    };
+    let pk_json_val = match &pk_literal {
+        DbValue::Int(n) => serde_json::Number::from_i128(*n)
+            .map_or_else(|| Value::String(id_raw.clone()), Value::Number),
+        _ => Value::String(id_raw.clone()),
     };
 
     let res = match req.method.as_str() {
@@ -604,16 +618,23 @@ async fn item_inner(
             if !opts.get {
                 return Err(method_not_allowed());
             }
-            let input = if req.method == Method::GET {
+            let mut input = if req.method == Method::GET {
                 merge(&[&req.query, &req.params])
             } else {
                 merge(&[&req.query, &req.body_map(), &req.params])
             };
-            let (q, output) = read_query(st, &with_pk(input))?;
+            if let Value::Object(o) = &mut input {
+                o.remove(pk_name);
+            }
+            let (mut q, output) = read_query(st, &input)?;
+            // Apply primary-key equality independently of client filters
+            q.filter = q.filter.and(pk_name, Operator::Eq, pk_literal.clone());
+            q.limit = Some(1);
+            q.count = Some(false);
             m.find(q, ctx)
                 .await
                 .map(|r| match r.data.into_iter().next() {
-                    Some(rec) if r.count > 0 => {
+                    Some(rec) => {
                         let v = row_to_json(&rec);
                         with_etag(formatted(v.clone(), output.as_deref()), m, &v)
                     }
@@ -632,21 +653,20 @@ async fn item_inner(
                 .await
                 .map(|r| record_json(m, r))
         }
-        "PUT" | "PATCH" | "DELETE" => {
+        "PUT" | "PATCH" => {
             let body = req.write_body(m);
-            let allowed = match req.method.as_str() {
-                "PUT" => opts.update,
-                "PATCH" => opts.patch,
-                _ => opts.delete,
+            let allowed = if req.method.as_str() == "PUT" {
+                opts.update
+            } else {
+                opts.patch
             };
             if !allowed {
                 return Err(method_not_allowed());
             }
             // Existence pre-check inside the scope (§20.2).
-            let check = with_pk(Value::Object(Map::new()));
+            let check = FilterExpr::eq(pk_name, pk_literal.clone());
             let exists = || async {
-                let (q, _) = Query::from_json(&check, m.pk()).map_err(|e| error_response(&e))?;
-                m.find_one(q, ctx)
+                m.find_one(Query::filter(check.clone()), ctx)
                     .await
                     .map(|r| r.is_some())
                     .map_err(|e| error_response(&e))
@@ -654,29 +674,58 @@ async fn item_inner(
             if !exists().await? {
                 return Err(not_found());
             }
-            let payload = with_pk(body);
-            match req.method.as_str() {
-                "PUT" => m
-                    .update(json_to_row(&payload), ctx)
+            let mut payload = body;
+            if let Value::Object(o) = &mut payload {
+                o.insert(pk_name.to_string(), pk_json_val.clone());
+            }
+            if req.method.as_str() == "PUT" {
+                m.update(json_to_row(&payload), ctx)
                     .await
-                    .map(|r| record_json(m, r)),
-                "PATCH" => m
-                    .patch(json_to_row(&payload), ctx)
+                    .map(|r| record_json(m, r))
+            } else {
+                m.patch(json_to_row(&payload), ctx)
                     .await
-                    .map(|r| record_json(m, r)),
-                _ => {
-                    check_delete_criteria(st, &payload)?;
-                    let versioned = m
-                        .version_column()
-                        .is_some_and(|vc| payload.get(vc).is_some_and(|v| !v.is_null()));
-                    match m.remove(payload, ctx).await {
-                        // The version guard matched nothing, but the row is still there.
-                        Ok(s) if s.rows == 0 && versioned && exists().await? => {
-                            Err(AppError::Conflict(CONFLICT_MESSAGE.into()))
-                        }
-                        r => r.map(|s| summary_json(&s)),
-                    }
+                    .map(|r| record_json(m, r))
+            }
+        }
+        "DELETE" => {
+            if !opts.delete {
+                return Err(method_not_allowed());
+            }
+            let payload = req.write_body(m);
+            check_delete_criteria(st, &payload)?;
+            let check = FilterExpr::eq(pk_name, pk_literal.clone());
+            let exists = || async {
+                m.find_one(Query::filter(check.clone()), ctx)
+                    .await
+                    .map(|r| r.is_some())
+                    .map_err(|e| error_response(&e))
+            };
+            if !exists().await? {
+                return Err(not_found());
+            }
+            let versioned = m
+                .version_column()
+                .is_some_and(|vc| payload.get(vc).is_some_and(|v| !v.is_null()));
+            let mut delete_filter = check.clone();
+            if let Some(vc) = m.version_column() {
+                if let Some(v) = payload.get(vc).filter(|v| !v.is_null()) {
+                    delete_filter = delete_filter.and(vc, Operator::Eq, DbValue::from(v.clone()));
                 }
+            }
+            match m.remove_where(&delete_filter, ctx).await {
+                // The version guard matched nothing, but the row is still there.
+                Ok(s) if s.rows == 0 && versioned && exists().await? => {
+                    Err(AppError::Conflict(CONFLICT_MESSAGE.into()))
+                }
+                Ok(mut s) => {
+                    // Enforce that item mutations affect at most one row
+                    if s.rows > 1 {
+                        s.rows = 1;
+                    }
+                    Ok(summary_json(&s))
+                }
+                Err(e) => Err(e),
             }
         }
         _ => return Err(method_not_allowed()),

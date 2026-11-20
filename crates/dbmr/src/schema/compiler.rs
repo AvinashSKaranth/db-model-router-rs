@@ -53,6 +53,7 @@ pub fn schema_to_model_meta(schema: &Schema) -> Vec<ModelMeta> {
                 search_columns: table_def.search_columns.clone().unwrap_or_default(),
                 hidden: table_def.hidden.clone().unwrap_or_default(),
                 version: table_def.version.clone(),
+                require_scope: table_def.require_scope.clone().unwrap_or_default(),
             };
 
             ModelMeta {

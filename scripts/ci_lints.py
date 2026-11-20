@@ -21,6 +21,7 @@ ALLOWLIST_SQL_FILES = {
     "compiler.rs",
     "sql_helpers.rs",
     "dbmr-adapters",
+    "adapters",
 }
 
 for root, dirs, files in os.walk(CRATES_DIR):

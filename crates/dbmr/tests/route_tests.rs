@@ -492,3 +492,16 @@ async fn malformed_json_is_400() {
         json!({"message": "Malformed JSON body", "type": "danger"})
     );
 }
+
+#[tokio::test]
+async fn item_route_path_id_is_literal_not_filter_operator() {
+    let app = app().await;
+    seed(&app).await;
+    // Attempting range delete via path ID `DELETE /%3E%3D1` (which is '>=1')
+    let r = call(&app, "DELETE", "/%3E%3D1", None).await;
+    // Must be 404 Not Found because literal PK equality is applied
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // Verify that all 3 rows still exist!
+    let list = call(&app, "GET", "/", None).await;
+    assert_eq!(list.json()["count"], 3);
+}

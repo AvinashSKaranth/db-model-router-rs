@@ -22,11 +22,11 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 NODE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "..", "db-model-router")
 OUT = os.path.join(ROOT, "tests", "traceability.json")
 
-ROUTE = "crates/dbmr-http/tests/route_tests.rs"
+ROUTE = "crates/dbmr/tests/route_tests.rs"
 MODEL = "crates/dbmr/tests/model_contract.rs"
-FILTER = "crates/dbmr-core/tests/filter_tests.rs"
-SCHEMA = "crates/dbmr-schema/tests/schema_tests.rs"
-SQLITE = "crates/dbmr-adapters/tests/sqlite_tests.rs"
+FILTER = "crates/dbmr/tests/filter_tests.rs"
+SCHEMA = "crates/dbmr/tests/schema_tests.rs"
+SQLITE = "crates/dbmr/tests/sqlite_tests.rs"
 DBS = "postgres|mysql|mariadb|cockroachdb|mssql|oracle|mongodb|redis|dynamodb"
 
 # (regex on path relative to Node repo, status, rust refs, note). First match wins.
@@ -36,17 +36,17 @@ RULES = [
     (r"test/features\.test\.js", "open", [], "Mixed: OpenAPI generator (out of scope) + model features; not ported case-by-case"),
     (r"test/unit/route\.query-ultimate-express", "waived", [], "Express monkeypatch; Axum handles QUERY natively"),
     (r"test/dev\.js", "waived", [], "Upstream dev scratch file"),
-    (rf"test/adapters/({DBS})\.", "unverified", ["crates/dbmr-adapters/tests/{db}_tests.rs"], "Needs live service (docker compose)"),
-    (rf"test/properties/({DBS})\.filter", "unverified", ["crates/dbmr-adapters/tests/{db}_tests.rs"], "Needs live service"),
+    (rf"test/adapters/({DBS})\.", "unverified", ["crates/dbmr/tests/{db}_tests.rs"], "Needs live service (docker compose)"),
+    (rf"test/properties/({DBS})\.filter", "unverified", ["crates/dbmr/tests/{db}_tests.rs"], "Needs live service"),
     (r"test/adapters/sqlite3\.route", "covered", [ROUTE], ""),
     (r"test/adapters/sqlite3\.", "covered", [SQLITE, MODEL], ""),
     (r"test/(route\.test|filter-operators\.route|unit/(route\.query-method|api-query|csv-export|vulnerability-security)|properties/(route|response-shape))", "covered", [ROUTE], ""),
-    (r"test/(filter-operators\.test|unit/(parse-filters|sort-state)|properties/(filter|search|sqlite3\.filter))", "covered", [FILTER, "crates/dbmr-adapters/src/compiler.rs"], ""),
+    (r"test/(filter-operators\.test|unit/(parse-filters|sort-state)|properties/(filter|search|sqlite3\.filter))", "covered", [FILTER, "crates/dbmr/src/adapters/compiler.rs"], ""),
     (r"test/(model\.|unit/(model\.hooks|transaction|null-impact)|encryption\.model|json-consistency|properties/model-roundtrip)", "covered", [MODEL], ""),
-    (r"test/encryption\.unit", "covered", ["crates/dbmr-core/src/encryption.rs"], "unit tests in module"),
-    (r"test/(schema-(validator|parser|to-meta)|properties/schema)", "covered", [SCHEMA, "crates/dbmr-schema/tests/proptest_schema.rs"], ""),
-    (r"test/kafka\.test", "covered", ["crates/dbmr-kafka/tests/kafka_tests.rs"], ""),
-    (r"test/kafka\.integration", "unverified", ["crates/dbmr-kafka/tests/kafka_tests.rs"], "Needs live Kafka"),
+    (r"test/encryption\.unit", "covered", ["crates/dbmr/src/core/encryption.rs"], "unit tests in module"),
+    (r"test/(schema-(validator|parser|to-meta)|properties/schema)", "covered", [SCHEMA, "crates/dbmr/tests/proptest_schema.rs"], ""),
+    (r"test/kafka\.test", "covered", ["crates/dbmr/tests/kafka_tests.rs"], ""),
+    (r"test/kafka\.integration", "unverified", ["crates/dbmr/tests/kafka_tests.rs"], "Needs live Kafka"),
     (r"test/db\.(individual|multiple)", "covered", ["crates/dbmr/tests/facade_tests.rs"], "global db shim (ADR-0008)"),
 ]
 

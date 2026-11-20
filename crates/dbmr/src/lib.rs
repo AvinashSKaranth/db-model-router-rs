@@ -70,7 +70,7 @@ pub fn model_from_meta(
             // Timestamps named in the schema are set by the model.
             auto_created_at: meta.option.created_at.clone(),
             auto_modified_at: meta.option.modified_at.clone(),
-            require_scope: Vec::new(),
+            require_scope: meta.option.require_scope.clone(),
         })
         .encryption_shared(encryption)
         .build()
