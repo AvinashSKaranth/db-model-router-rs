@@ -66,14 +66,23 @@ Every `create_model_router(model)` router automatically exposes both individual 
 | HTTP Method | Route | Type | Request Payload | Response |
 |---|---|---|---|---|
 | `GET` | `/resources` | Bulk | Query params (`?page=0&size=30&...`) | `{"data": [...], "count": total}` |
+| `OPTIONS` | `/resources` | Discovery | None | Allowed methods `{"resource": "collection", "methods": [...]}` + `Allow` header |
+| `DISCOVER` | `/resources` | Discovery | Query params (`?column=col&q=term`) or JSON body (`{"column":"col","query":"term"}`) | `{"columns": [...]}` or `{"column": "col", "values": [...]}` |
 | `POST` | `/resources` | Individual | `{ "title": "My Post" }` | Created record `{ "id": 1, ... }` |
 | `POST` | `/resources` | Bulk | `{"data": [{ "title": "P1" }, { "title": "P2" }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
 | `PUT` | `/resources` | Bulk | `{"data": [{ "id": 1, ... }, { "id": 2, ... }]}` | `{"rows": 2, "message": "...", "type": "success"}` |
 | `DELETE` | `/resources` | Bulk | Non-empty filter criteria object | `{"rows": n, "message": "...", "type": "success"}` |
 | `GET` | `/resources/:id` | Individual | None | Single record `{ "id": 1, ... }` |
+| `OPTIONS` | `/resources/:id` | Discovery | None | Allowed methods `{"resource": "item", "methods": [...]}` + `Allow` header |
 | `PUT` | `/resources/:id` | Individual | `{ "title": "Updated" }` (full replace) | Updated record `{ "id": 1, ... }` |
 | `PATCH` | `/resources/:id` | Individual | `{ "title": "Partial update" }` | Updated record `{ "id": 1, ... }` |
 | `DELETE` | `/resources/:id` | Individual | None | `{"rows": 1, "message": "...", "type": "success"}` |
+
+> **DISCOVER Route (Cardinality & In-Memory Value Discovery)**:
+> The custom HTTP method `DISCOVER /resources` inspects filterable columns, types, and distinct values. For low-cardinality columns ($\le 50$ distinct values), it returns `mode: "fixed"` with the complete enum values list. For high-cardinality columns ($> 50$ values), it returns `mode: "searchable"` and requires $\ge 3$ search characters in `q` or `{"query": "..."}`. On application start, the router automatically pre-warms and caches discovery in memory for unscoped models with $\le 100$ columns, serving discovery and fixed enum filters directly from memory without repetitive database calls. `DISCOVER` is anchored strictly on the collection route (`/resources`) and is rejected with `405 Method Not Allowed` on item routes (`/:id` or `/:column`) to prevent route conflicts with child tables and sub-resources.
+>
+> **OPTIONS Route**:
+> `OPTIONS` requests on both collection (`/resources`) and item (`/resources/:id`) routes return `200 OK` with an RFC 9110 `Allow` header and a JSON body describing the available HTTP methods based on active `RouterOptions`.
 
 ## Quickstart
 

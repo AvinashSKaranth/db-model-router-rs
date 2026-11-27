@@ -1,6 +1,6 @@
 use crate::adapters::compiler::{
-    compile_order_by, compile_update, compile_where, format_remove_message, int_or_text, summary,
-    SqlDialect,
+    compile_distinct, compile_order_by, compile_update, compile_where, format_remove_message,
+    int_or_text, summary, SqlDialect,
 };
 use crate::core::adapter::{DatabaseAdapter, PoolConfig, TransactionAdapter};
 use crate::core::error::{AppError, Result};
@@ -384,6 +384,29 @@ impl DatabaseAdapter for SqliteAdapter {
 
     fn escape_id(&self, name: &str) -> String {
         D.quote_identifier(name)
+    }
+
+    async fn distinct_values(
+        &self,
+        table: &str,
+        column: &str,
+        safe_delete: Option<&str>,
+        filter: Option<&FilterExpr>,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DbValue>> {
+        let empty = FilterExpr::empty();
+        let f = filter.unwrap_or(&empty);
+        let (sql, params) = compile_distinct(D, table, column, f, safe_delete, search, limit, None);
+        let rows = self.query(&sql, &params).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut r| {
+                r.shift_remove("val")
+                    .or_else(|| r.into_iter().next().map(|(_, v)| v))
+            })
+            .filter(|v| !v.is_null())
+            .collect())
     }
 
     async fn begin_tx(&self) -> Result<Arc<dyn TransactionAdapter>> {

@@ -25,7 +25,10 @@
 //! | `GET/QUERY /{id}` | `find` (pk = path) → record or 404 |
 //! | `POST /{id}` | `insert` (path id ignored, PK stripped) |
 //! | `PUT/PATCH/DELETE /{id}` | `find_one` pre-check (pk) → `update`/`patch`/`remove` |
+//! | `OPTIONS /{id}` | allowed item methods + `Allow` header |
 //! | `GET/QUERY /` | `list` → `{data, count}` |
+//! | `OPTIONS /` | allowed collection methods + `Allow` header |
+//! | `DISCOVER /` | `filters` → column discovery and enum values based on cardinality |
 //! | `POST /` | `insert` for an object body, `insert_many` for `{data: [...]}` |
 //! | `PUT /` | `update_many` on `{data: [...]}` |
 //! | `DELETE /` | `remove` (non-empty body required) |
@@ -65,9 +68,178 @@ pub const BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// parameters of an enclosing nested router).
 const ID_PARAM: &str = "__dbmr_id";
 
+/// Maximum distinct values for a column to be treated as a fixed enum.
+pub const CARDINALITY_FIXED_LIMIT: usize = 50;
+/// Probing limit to check if cardinality exceeds CARDINALITY_FIXED_LIMIT.
+pub const CARDINALITY_PROBE_LIMIT: usize = CARDINALITY_FIXED_LIMIT + 1;
+/// Maximum number of columns in a model to automatically pre-warm on application start.
+pub const DEFAULT_PREWARM_COLUMNS_LIMIT: usize = 100;
+
+#[derive(Debug, Clone)]
+pub struct CachedColumn {
+    pub column: String,
+    pub col_type: String,
+    pub is_fixed: bool,
+    pub cardinality: Value,
+    pub values: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveryCache {
+    pub table: String,
+    pub columns: Vec<CachedColumn>,
+    pub full_response: Value,
+    pub created_at: std::time::Instant,
+}
+
 pub struct ModelRouterState {
     pub model: Arc<Model>,
     pub options: RouterOptions,
+    pub discovery_cache: tokio::sync::RwLock<Option<DiscoveryCache>>,
+    warm_lock: tokio::sync::Mutex<()>,
+}
+
+/// Build discovery metadata and cache entry from a probed column's distinct values.
+fn build_column_discovery(col: &str, col_type: &str, probe: Vec<DbValue>) -> (CachedColumn, Value) {
+    let is_fixed = probe.len() <= CARDINALITY_FIXED_LIMIT;
+    let mode = if is_fixed { "fixed" } else { "searchable" };
+    let cardinality_val = if is_fixed {
+        json!(probe.len())
+    } else {
+        json!(">50")
+    };
+    let values: Vec<Value> = if is_fixed {
+        probe.into_iter().map(|v| v.to_json()).collect()
+    } else {
+        vec![]
+    };
+
+    let mut meta = json!({
+        "column": col,
+        "type": col_type,
+        "filterable": true,
+        "cardinality": cardinality_val,
+        "mode": mode,
+        "values": values
+    });
+    if !is_fixed {
+        meta["min_query_length"] = json!(3);
+    }
+
+    let cached = CachedColumn {
+        column: col.to_string(),
+        col_type: col_type.to_string(),
+        is_fixed,
+        cardinality: cardinality_val,
+        values,
+    };
+    (cached, meta)
+}
+
+fn encrypted_column_meta(col: &str, col_type: &str) -> Value {
+    json!({
+        "column": col,
+        "type": col_type,
+        "filterable": false,
+        "cardinality": Value::Null,
+        "mode": "unsupported",
+        "values": []
+    })
+}
+
+fn column_type(model: &Model, col: &str) -> String {
+    model
+        .structure()
+        .get(col)
+        .cloned()
+        .unwrap_or_else(|| "string".into())
+}
+
+/// Collect visible (non-hidden, non-encrypted) columns including an implicit PK if not in `structure`.
+fn discoverable_columns(model: &Model, hidden_lower: &[String]) -> Vec<(String, String)> {
+    let mut cols: Vec<(String, String)> = model
+        .structure()
+        .iter()
+        .filter(|(col, _)| {
+            !hidden_lower.contains(&col.trim().to_lowercase()) && !model.is_encrypted_column(col)
+        })
+        .map(|(c, t)| (c.clone(), t.clone()))
+        .collect();
+    let pk = model.pk();
+    if !model.structure().contains_key(pk)
+        && !hidden_lower.contains(&pk.trim().to_lowercase())
+        && !model.is_encrypted_column(pk)
+    {
+        cols.insert(0, (pk.to_string(), column_type(model, pk)));
+    }
+    cols
+}
+
+impl ModelRouterState {
+    /// Construct a new router state.
+    pub fn new(model: Arc<Model>, options: RouterOptions) -> Self {
+        Self {
+            model,
+            options,
+            discovery_cache: tokio::sync::RwLock::new(None),
+            warm_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Invalidate the in-memory discovery cache.
+    pub async fn invalidate_discovery_cache(&self) {
+        let mut cache = self.discovery_cache.write().await;
+        *cache = None;
+    }
+
+    /// Pre-warm or refresh the in-memory discovery cache.
+    pub async fn warm_discovery_cache(&self, ctx: &Context) -> Result<(), AppError> {
+        let model = &self.model;
+        if !model.options().require_scope.is_empty() || model.has_before_find() {
+            return Ok(());
+        }
+
+        let hidden_lower: Vec<String> = model
+            .hidden_columns()
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect();
+
+        let visible_cols = discoverable_columns(model, &hidden_lower);
+        let mut cached_cols = Vec::with_capacity(visible_cols.len());
+        let mut col_metas = Vec::with_capacity(model.structure().len() + 1);
+
+        for (col, col_type) in visible_cols {
+            let probe = model
+                .distinct_values(&col, None, CARDINALITY_PROBE_LIMIT, ctx)
+                .await?;
+            let (cached, meta) = build_column_discovery(&col, &col_type, probe);
+            col_metas.push(meta);
+            cached_cols.push(cached);
+        }
+
+        for (col, col_type) in model.structure() {
+            if !hidden_lower.contains(&col.trim().to_lowercase()) && model.is_encrypted_column(col)
+            {
+                col_metas.push(encrypted_column_meta(col, col_type));
+            }
+        }
+
+        let full_resp = json!({
+            "table": model.table_name(),
+            "columns": col_metas
+        });
+
+        let mut cache = self.discovery_cache.write().await;
+        *cache = Some(DiscoveryCache {
+            table: model.table_name().to_string(),
+            columns: cached_cols,
+            full_response: full_resp,
+            created_at: std::time::Instant::now(),
+        });
+
+        Ok(())
+    }
 }
 
 /// Which operations a model router serves. A disabled operation answers
@@ -95,6 +267,12 @@ pub struct RouterOptions {
     pub bulk_delete: bool,
     /// `output_content_type=csv|xml`; when off those are `400 "Export is disabled"`.
     pub export: bool,
+    /// `DISCOVER /` column discovery and filter values.
+    pub filters: bool,
+    /// TTL for in-memory discovery cache. Default 5 minutes (300s). None for no expiry.
+    pub discovery_cache_ttl: Option<std::time::Duration>,
+    /// Maximum number of columns to pre-warm on start (default 100).
+    pub prewarm_columns_limit: usize,
 }
 
 impl Default for RouterOptions {
@@ -111,18 +289,22 @@ impl Default for RouterOptions {
             delete: true,
             bulk_delete: true,
             export: true,
+            filters: true,
+            discovery_cache_ttl: Some(std::time::Duration::from_secs(300)),
+            prewarm_columns_limit: DEFAULT_PREWARM_COLUMNS_LIMIT,
         }
     }
 }
 
 impl RouterOptions {
-    /// `list`, `get` and `export` only.
+    /// `list`, `get`, `export` and `filters` only.
     #[must_use]
-    pub fn read_only() -> Self {
+    pub const fn read_only() -> Self {
         Self {
             list: true,
             get: true,
             export: true,
+            filters: true,
             create: false,
             bulk_create: false,
             update: false,
@@ -130,6 +312,8 @@ impl RouterOptions {
             patch: false,
             delete: false,
             bulk_delete: false,
+            discovery_cache_ttl: Some(std::time::Duration::from_secs(300)),
+            prewarm_columns_limit: DEFAULT_PREWARM_COLUMNS_LIMIT,
         }
     }
 }
@@ -143,10 +327,24 @@ pub fn create_model_router(model: impl Into<Arc<Model>>) -> Router {
 
 /// [`create_model_router`] serving only the operations enabled in `options`.
 pub fn create_model_router_with(model: impl Into<Arc<Model>>, options: RouterOptions) -> Router {
-    let state = Arc::new(ModelRouterState {
-        model: Arc::new(model.into().public_view()),
+    let state = Arc::new(ModelRouterState::new(
+        Arc::new(model.into().public_view()),
         options,
-    });
+    ));
+
+    if state.options.filters
+        && state.model.options().require_scope.is_empty()
+        && !state.model.has_before_find()
+        && state.model.structure().len() <= state.options.prewarm_columns_limit
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let st = Arc::clone(&state);
+            handle.spawn(async move {
+                let _ = st.warm_discovery_cache(&Context::system()).await;
+            });
+        }
+    }
+
     Router::new()
         .route("/", MethodRouter::new().fallback(collection))
         .route(
@@ -195,12 +393,79 @@ fn not_found() -> Response {
         .into_response()
 }
 
-fn method_not_allowed() -> Response {
-    (
+pub fn allowed_collection_methods(opts: &RouterOptions) -> Vec<&'static str> {
+    let mut methods = Vec::new();
+    methods.push("OPTIONS");
+    if opts.list {
+        methods.push("GET");
+        methods.push("QUERY");
+    }
+    if opts.create || opts.bulk_create {
+        methods.push("POST");
+    }
+    if opts.bulk_update {
+        methods.push("PUT");
+    }
+    if opts.bulk_delete {
+        methods.push("DELETE");
+    }
+    if opts.filters {
+        methods.push("DISCOVER");
+    }
+    methods
+}
+
+pub fn allowed_item_methods(opts: &RouterOptions) -> Vec<&'static str> {
+    let mut methods = Vec::new();
+    methods.push("OPTIONS");
+    if opts.get {
+        methods.push("GET");
+        methods.push("QUERY");
+    }
+    if opts.create {
+        methods.push("POST");
+    }
+    if opts.update {
+        methods.push("PUT");
+    }
+    if opts.patch {
+        methods.push("PATCH");
+    }
+    if opts.delete {
+        methods.push("DELETE");
+    }
+    methods
+}
+
+fn method_not_allowed(allow: &[&str]) -> Response {
+    let mut resp = (
         StatusCode::METHOD_NOT_ALLOWED,
         Json(json!({ "message": "Method Not Allowed", "type": "danger" })),
     )
-        .into_response()
+        .into_response();
+    if !allow.is_empty() {
+        let allow_str = allow.join(", ");
+        if let Ok(val) = HeaderValue::try_from(allow_str) {
+            resp.headers_mut().insert(header::ALLOW, val);
+        }
+    }
+    resp
+}
+
+fn options_response(resource: &str, allow: &[&str]) -> Response {
+    let allow_str = allow.join(", ");
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "resource": resource,
+            "methods": allow
+        })),
+    )
+        .into_response();
+    if let Ok(val) = HeaderValue::try_from(allow_str) {
+        resp.headers_mut().insert(header::ALLOW, val);
+    }
+    resp
 }
 
 fn invalid_filter() -> Response {
@@ -514,6 +779,350 @@ fn check_delete_criteria(st: &ModelRouterState, criteria: &Value) -> Result<(), 
 
 // ------------------------------------------------------------------ handlers
 
+async fn filters_inner(st: &ModelRouterState, req: &Req) -> Result<Response, Response> {
+    let model = &st.model;
+
+    // Enforce required scope and evaluate row-level scope authorization upfront
+    let _ = model.scope(&req.ctx).map_err(|e| error_response(&e))?;
+
+    let hidden_lower: Vec<String> = model
+        .hidden_columns()
+        .iter()
+        .map(|h| h.trim().to_lowercase())
+        .collect();
+
+    // 1. Determine if a specific column is requested
+    let body_map = req.body.as_object();
+
+    let mut target_col = req
+        .query
+        .get("column")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body_map
+                .and_then(|b| b.get("column"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string);
+
+    let mut search_val: Option<String> = None;
+
+    // Extract search query if present: ?query=, ?q=, ?search= or JSON body
+    if let Some(q) = req
+        .query
+        .get("query")
+        .or_else(|| req.query.get("q"))
+        .or_else(|| req.query.get("search"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body_map.and_then(|b| {
+                b.get("query")
+                    .or_else(|| b.get("q"))
+                    .or_else(|| b.get("search"))
+                    .and_then(|v| v.as_str())
+            })
+        })
+    {
+        search_val = Some(q.to_string());
+    }
+
+    // Also support passing column directly as a query parameter or body key: e.g. ?author=ali or {"author": "ali"}
+    let is_known_col = |k: &str| model.structure().contains_key(k) || k == model.pk();
+    if target_col.is_none() {
+        for (k, v) in &req.query {
+            if k != "column" && k != "q" && k != "query" && k != "search" && is_known_col(k) {
+                target_col = Some(k.clone());
+                if search_val.is_none() {
+                    if let Some(s) = v.as_str() {
+                        search_val = Some(s.to_string());
+                    }
+                }
+                break;
+            }
+        }
+        if target_col.is_none() {
+            if let Some(b) = body_map {
+                for (k, v) in b {
+                    if k != "column" && k != "q" && k != "query" && k != "search" && is_known_col(k)
+                    {
+                        target_col = Some(k.clone());
+                        if search_val.is_none() {
+                            if let Some(s) = v.as_str() {
+                                search_val = Some(s.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure hidden or encrypted column access is rejected with 422 before checking cache
+    if let Some(ref col) = target_col {
+        if hidden_lower.contains(&col.trim().to_lowercase()) || model.is_encrypted_column(col) {
+            return Err(invalid_filter());
+        }
+        if !is_known_col(col) {
+            return Err(not_found());
+        }
+    }
+
+    // Carry nested path parameters into filter criteria (e.g. /authors/{author_id}/books)
+    let mut path_filter = FilterExpr::empty();
+    for (k, v) in &req.params {
+        if let Some(col_type) = model.structure().get(k) {
+            if let Some(s) = v.as_str() {
+                let db_val = coerce_path_param(col_type, s);
+                path_filter = path_filter.and(k, Operator::Eq, db_val);
+            }
+        }
+    }
+    let has_path_filter = !path_filter.is_empty();
+    let extra_filter = if has_path_filter {
+        Some(&path_filter)
+    } else {
+        None
+    };
+
+    // Shared cache can only be used if model requires no scope, has no before_find hook,
+    // request has no tenant scope, and there are no nested path parameters filtering the table.
+    let can_use_shared_cache = model.options().require_scope.is_empty()
+        && !model.has_before_find()
+        && req.ctx.scope.is_empty()
+        && !has_path_filter;
+
+    if can_use_shared_cache {
+        let is_cache_fresh = |c: &DiscoveryCache| match st.options.discovery_cache_ttl {
+            Some(ttl) => c.created_at.elapsed() < ttl,
+            None => true,
+        };
+        let is_valid = {
+            let cache_read = st.discovery_cache.read().await;
+            cache_read.as_ref().is_some_and(is_cache_fresh)
+        };
+
+        if !is_valid {
+            let _guard = st.warm_lock.lock().await;
+            let still_invalid = {
+                let cache_read = st.discovery_cache.read().await;
+                !cache_read.as_ref().is_some_and(is_cache_fresh)
+            };
+            if still_invalid {
+                st.warm_discovery_cache(&req.ctx)
+                    .await
+                    .map_err(|e| error_response(&e))?;
+            }
+        }
+
+        let cache_read = st.discovery_cache.read().await;
+        if let Some(ref cache) = *cache_read {
+            // Case A: Specific column requested
+            if let Some(ref col) = target_col {
+                if let Some(cached_col) = cache.columns.iter().find(|c| &c.column == col) {
+                    if cached_col.is_fixed {
+                        // Fixed enum column: completely served from in-memory cache!
+                        if let Some(ref query_str) = search_val {
+                            let query_lower = query_str.to_lowercase();
+                            let filtered: Vec<Value> = cached_col
+                                .values
+                                .iter()
+                                .filter(|v| match v {
+                                    Value::String(s) => s.to_lowercase().contains(&query_lower),
+                                    other => {
+                                        other.to_string().to_lowercase().contains(&query_lower)
+                                    }
+                                })
+                                .cloned()
+                                .collect();
+                            return Ok(ok_json(json!({
+                                "column": cached_col.column,
+                                "type": cached_col.col_type,
+                                "filterable": true,
+                                "cardinality": cached_col.cardinality,
+                                "mode": "fixed",
+                                "query": query_str,
+                                "values": filtered
+                            })));
+                        }
+                        return Ok(ok_json(json!({
+                            "column": cached_col.column,
+                            "type": cached_col.col_type,
+                            "filterable": true,
+                            "cardinality": cached_col.cardinality,
+                            "mode": "fixed",
+                            "values": cached_col.values.clone()
+                        })));
+                    }
+
+                    // Searchable column
+                    if let Some(ref query_str) = search_val {
+                        if query_str.chars().count() < 3 {
+                            return Ok(ok_json(json!({
+                                "column": cached_col.column,
+                                "type": cached_col.col_type,
+                                "filterable": true,
+                                "cardinality": cached_col.cardinality,
+                                "mode": "searchable",
+                                "query": query_str,
+                                "min_query_length": 3,
+                                "message": "Minimum 3 characters required to search values",
+                                "values": []
+                            })));
+                        }
+                        // >= 3 letters: targeted search on DB with limit 20
+                        let matches = model
+                            .distinct_values(&cached_col.column, Some(query_str), 20, &req.ctx)
+                            .await
+                            .map_err(|e| error_response(&e))?;
+                        let values: Vec<Value> = matches.into_iter().map(|v| v.to_json()).collect();
+                        return Ok(ok_json(json!({
+                            "column": cached_col.column,
+                            "type": cached_col.col_type,
+                            "filterable": true,
+                            "cardinality": cached_col.cardinality,
+                            "mode": "searchable",
+                            "query": query_str,
+                            "values": values
+                        })));
+                    }
+                    return Ok(ok_json(json!({
+                        "column": cached_col.column,
+                        "type": cached_col.col_type,
+                        "filterable": true,
+                        "cardinality": cached_col.cardinality,
+                        "mode": "searchable",
+                        "min_query_length": 3,
+                        "values": []
+                    })));
+                }
+            } else {
+                // Case B: Full table discovery -> serve full JSON from cache!
+                return Ok(ok_json(cache.full_response.clone()));
+            }
+        }
+    }
+
+    // Dynamic database query fallback (when scoped, hooked, path-filtered, or cache missed)
+    if let Some(col) = target_col {
+        let col_type = column_type(model, &col);
+
+        // Probe cardinality with limit CARDINALITY_PROBE_LIMIT
+        let probe = model
+            .distinct_values_with_filter(
+                &col,
+                extra_filter,
+                None,
+                CARDINALITY_PROBE_LIMIT,
+                &req.ctx,
+            )
+            .await
+            .map_err(|e| error_response(&e))?;
+
+        let (cached_col, meta) = build_column_discovery(&col, &col_type, probe);
+
+        if let Some(query_str) = search_val {
+            if !cached_col.is_fixed {
+                if query_str.chars().count() < 3 {
+                    return Ok(ok_json(json!({
+                        "column": col,
+                        "type": col_type,
+                        "filterable": true,
+                        "cardinality": cached_col.cardinality,
+                        "mode": "searchable",
+                        "query": query_str,
+                        "min_query_length": 3,
+                        "message": "Minimum 3 characters required to search values",
+                        "values": []
+                    })));
+                }
+
+                let matches = model
+                    .distinct_values_with_filter(&col, extra_filter, Some(&query_str), 20, &req.ctx)
+                    .await
+                    .map_err(|e| error_response(&e))?;
+
+                let values: Vec<Value> = matches.into_iter().map(|v| v.to_json()).collect();
+                return Ok(ok_json(json!({
+                    "column": col,
+                    "type": col_type,
+                    "filterable": true,
+                    "cardinality": cached_col.cardinality,
+                    "mode": "searchable",
+                    "query": query_str,
+                    "values": values
+                })));
+            }
+
+            let query_lower = query_str.to_lowercase();
+            let filtered: Vec<Value> = cached_col
+                .values
+                .into_iter()
+                .filter(|v| match v {
+                    Value::String(s) => s.to_lowercase().contains(&query_lower),
+                    other => other.to_string().to_lowercase().contains(&query_lower),
+                })
+                .collect();
+
+            return Ok(ok_json(json!({
+                "column": col,
+                "type": col_type,
+                "filterable": true,
+                "cardinality": cached_col.cardinality,
+                "mode": "fixed",
+                "query": query_str,
+                "values": filtered
+            })));
+        }
+
+        return Ok(ok_json(meta));
+    }
+
+    let visible_cols = discoverable_columns(model, &hidden_lower);
+    let mut col_metas = Vec::with_capacity(model.structure().len() + 1);
+    for (col, col_type) in visible_cols {
+        let probe = model
+            .distinct_values_with_filter(
+                &col,
+                extra_filter,
+                None,
+                CARDINALITY_PROBE_LIMIT,
+                &req.ctx,
+            )
+            .await
+            .map_err(|e| error_response(&e))?;
+
+        let (_, meta) = build_column_discovery(&col, &col_type, probe);
+        col_metas.push(meta);
+    }
+    for (col, col_type) in model.structure() {
+        if !hidden_lower.contains(&col.trim().to_lowercase()) && model.is_encrypted_column(col) {
+            col_metas.push(encrypted_column_meta(col, col_type));
+        }
+    }
+
+    let full_resp = json!({
+        "table": model.table_name(),
+        "columns": col_metas
+    });
+
+    Ok(ok_json(full_resp))
+}
+
+fn coerce_path_param(col_type: &str, raw: &str) -> DbValue {
+    let lower = col_type.to_ascii_lowercase();
+    if lower.contains("int") {
+        if let Ok(n) = raw.parse::<i128>() {
+            return DbValue::Int(n);
+        }
+    } else if lower.contains("bool") {
+        if let Ok(b) = raw.parse::<bool>() {
+            return DbValue::Bool(b);
+        }
+    }
+    DbValue::Text(raw.to_string())
+}
+
 async fn collection(
     State(st): State<Arc<ModelRouterState>>,
     params: Option<Path<HashMap<String, String>>>,
@@ -531,10 +1140,20 @@ async fn collection_inner(
 ) -> Result<Response, Response> {
     let req = read_request(params, req).await?;
     let (m, ctx, opts) = (&st.model, &req.ctx, &st.options);
+    let allowed = allowed_collection_methods(opts);
     let res = match req.method.as_str() {
+        "OPTIONS" => {
+            return Ok(options_response("collection", &allowed));
+        }
+        "DISCOVER" => {
+            if !opts.filters {
+                return Err(method_not_allowed(&allowed));
+            }
+            return filters_inner(st, &req).await;
+        }
         "GET" | "QUERY" => {
             if !opts.list {
-                return Err(method_not_allowed());
+                return Err(method_not_allowed(&allowed));
             }
             let input = if req.method == Method::GET {
                 merge(&[&req.query, &req.params])
@@ -552,23 +1171,24 @@ async fn collection_inner(
             let mut body = req.body.clone();
             strip_hidden(&mut body, m.hidden_columns());
             let single = post && body.is_object() && data_array(&body).is_none();
-            let allowed = match (post, single) {
+            let allowed_op = match (post, single) {
                 (true, true) => opts.create,
                 (true, false) => opts.bulk_create,
                 _ => opts.bulk_update,
             };
-            if !allowed {
-                return Err(method_not_allowed());
+            if !allowed_op {
+                return Err(method_not_allowed(&allowed));
             }
             if single {
                 let mut payload = body;
                 if let Value::Object(o) = &mut payload {
                     o.remove(m.pk());
                 }
-                return Ok(m
-                    .insert(json_to_row(&payload), ctx)
-                    .await
-                    .map_or_else(|e| error_response(&e), |r| record_json(m, r)));
+                let res = m.insert(json_to_row(&payload), ctx).await;
+                if res.is_ok() {
+                    st.invalidate_discovery_cache().await;
+                }
+                return Ok(res.map_or_else(|e| error_response(&e), |r| record_json(m, r)));
             }
             let Some(data) = data_array(&body) else {
                 return Err(bad_request("Request body must contain a 'data' array"));
@@ -579,20 +1199,27 @@ async fn collection_inner(
             } else {
                 m.update_many(rows, ctx).await
             };
+            if r.is_ok() {
+                st.invalidate_discovery_cache().await;
+            }
             r.map(|s| summary_json(&s))
         }
         "DELETE" => {
             if !opts.bulk_delete {
-                return Err(method_not_allowed());
+                return Err(method_not_allowed(&allowed));
             }
             if req.body.as_object().is_none_or(Map::is_empty) {
                 return Err(bad_request("Request body must contain filter criteria"));
             }
             let payload = data_array(&req.body).unwrap_or(&req.body).clone();
             check_delete_criteria(st, &payload)?;
-            m.remove(payload, ctx).await.map(|s| summary_json(&s))
+            let r = m.remove(payload, ctx).await;
+            if r.is_ok() {
+                st.invalidate_discovery_cache().await;
+            }
+            r.map(|s| summary_json(&s))
         }
-        _ => return Err(method_not_allowed()),
+        _ => return Err(method_not_allowed(&allowed)),
     };
     Ok(res.unwrap_or_else(|e| error_response(&e)))
 }
@@ -602,6 +1229,10 @@ async fn item(
     params: Option<Path<HashMap<String, String>>>,
     req: Request,
 ) -> Response {
+    let allowed = allowed_item_methods(&st.options);
+    if req.method().as_str() == "DISCOVER" {
+        return method_not_allowed(&allowed);
+    }
     item_inner(&st, params.map(|p| p.0).unwrap_or_default(), req)
         .await
         .unwrap_or_else(|r| r)
@@ -612,8 +1243,13 @@ async fn item_inner(
     params: HashMap<String, String>,
     req: Request,
 ) -> Result<Response, Response> {
+    let allowed = allowed_item_methods(&st.options);
+    if req.method().as_str() == "DISCOVER" {
+        return Err(method_not_allowed(&allowed));
+    }
     let req = read_request(params, req).await?;
     let (m, ctx, opts) = (&st.model, &req.ctx, &st.options);
+
     if matches!(req.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
         && data_array(&req.body).is_some()
     {
@@ -630,9 +1266,12 @@ async fn item_inner(
     };
 
     let res = match req.method.as_str() {
+        "OPTIONS" => {
+            return Ok(options_response("item", &allowed));
+        }
         "GET" | "QUERY" => {
             if !opts.get {
-                return Err(method_not_allowed());
+                return Err(method_not_allowed(&allowed));
             }
             let mut input = if req.method == Method::GET {
                 merge(&[&req.query, &req.params])
@@ -655,25 +1294,27 @@ async fn item_inner(
         }
         "POST" => {
             if !opts.create {
-                return Err(method_not_allowed());
+                return Err(method_not_allowed(&allowed));
             }
             let mut payload = req.write_body(m);
             if let Value::Object(o) = &mut payload {
                 o.remove(m.pk());
             }
-            m.insert(json_to_row(&payload), ctx)
-                .await
-                .map(|r| record_json(m, r))
+            let r = m.insert(json_to_row(&payload), ctx).await;
+            if r.is_ok() {
+                st.invalidate_discovery_cache().await;
+            }
+            r.map(|r| record_json(m, r))
         }
         "PUT" | "PATCH" => {
             let body = req.write_body(m);
-            let allowed = if req.method.as_str() == "PUT" {
+            let allowed_op = if req.method.as_str() == "PUT" {
                 opts.update
             } else {
                 opts.patch
             };
-            if !allowed {
-                return Err(method_not_allowed());
+            if !allowed_op {
+                return Err(method_not_allowed(&allowed));
             }
             // Existence pre-check inside the scope (§20.2).
             let id = item_id()?;
@@ -688,19 +1329,19 @@ async fn item_inner(
             if let Value::Object(o) = &mut payload {
                 o.insert(pk_name.to_string(), id.to_json());
             }
-            if req.method.as_str() == "PUT" {
-                m.update(json_to_row(&payload), ctx)
-                    .await
-                    .map(|r| record_json(m, r))
+            let r = if req.method.as_str() == "PUT" {
+                m.update(json_to_row(&payload), ctx).await
             } else {
-                m.patch(json_to_row(&payload), ctx)
-                    .await
-                    .map(|r| record_json(m, r))
+                m.patch(json_to_row(&payload), ctx).await
+            };
+            if r.is_ok() {
+                st.invalidate_discovery_cache().await;
             }
+            r.map(|r| record_json(m, r))
         }
         "DELETE" => {
             if !opts.delete {
-                return Err(method_not_allowed());
+                return Err(method_not_allowed(&allowed));
             }
             let payload = req.write_body(m);
             check_delete_criteria(st, &payload)?;
@@ -728,11 +1369,14 @@ async fn item_inner(
                 Ok(s) if s.rows == 0 && version.is_some() && exists().await? => {
                     Err(AppError::Conflict(CONFLICT_MESSAGE.into()))
                 }
-                Ok(s) => Ok(summary_json(&s)),
+                Ok(s) => {
+                    st.invalidate_discovery_cache().await;
+                    Ok(summary_json(&s))
+                }
                 Err(e) => Err(e),
             }
         }
-        _ => return Err(method_not_allowed()),
+        _ => return Err(method_not_allowed(&allowed)),
     };
     Ok(res.unwrap_or_else(|e| error_response(&e)))
 }

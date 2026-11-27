@@ -1536,7 +1536,7 @@ impl Model {
     /// The rows this call may touch, coerced to the column types. Fails closed with
     /// `401 "Missing scope: <col>"` when a `require_scope` column is missing (unless
     /// `ctx.system`) or a scope value is null.
-    fn scope(&self, ctx: &Context) -> Result<FilterExpr> {
+    pub fn scope(&self, ctx: &Context) -> Result<FilterExpr> {
         let missing = |c: &str| ctx.scope.get(c).is_none_or(Value::is_null);
         let required = self
             .inner
@@ -1953,6 +1953,99 @@ impl Model {
         self.db
             .count(self.table_name(), &filter, self.safe_delete())
             .await
+    }
+
+    /// Whether the model has a `before_find` hook attached.
+    #[must_use]
+    pub fn has_before_find(&self) -> bool {
+        self.inner.hooks.before_find.is_some()
+    }
+
+    /// Whether `col` is declared encrypted (or is a JSON parent containing encrypted fields).
+    #[must_use]
+    pub fn is_encrypted_column(&self, col: &str) -> bool {
+        let col = col.trim();
+        self.inner
+            .enc_meta
+            .columns
+            .iter()
+            .any(|(c, _)| c.trim().eq_ignore_ascii_case(col))
+            || self
+                .inner
+                .enc_meta
+                .json_keys
+                .iter()
+                .any(|(parent, _, _)| parent.trim().eq_ignore_ascii_case(col))
+    }
+
+    /// Distinct values for a column, scoped by `ctx.scope` and excluding soft-deleted rows.
+    /// If `search` is provided, filters for values containing the substring.
+    ///
+    /// # Errors
+    /// Returns [`AppError::UnprocessableEntity`] if the column is hidden or encrypted.
+    #[tracing::instrument(level = "debug", skip_all, fields(table = %self.inner.table, column = %column))]
+    pub async fn distinct_values(
+        &self,
+        column: &str,
+        search: Option<&str>,
+        limit: usize,
+        ctx: &Context,
+    ) -> Result<Vec<DbValue>> {
+        self.distinct_values_with_filter(column, None, search, limit, ctx)
+            .await
+    }
+
+    /// Inspect distinct values of a column with optional extra filter criteria (e.g. path parameters).
+    #[tracing::instrument(level = "debug", skip_all, fields(table = %self.inner.table, column = %column))]
+    pub async fn distinct_values_with_filter(
+        &self,
+        column: &str,
+        extra_filter: Option<&FilterExpr>,
+        search: Option<&str>,
+        limit: usize,
+        ctx: &Context,
+    ) -> Result<Vec<DbValue>> {
+        if self
+            .hidden_columns()
+            .iter()
+            .any(|h| h.trim().eq_ignore_ascii_case(column.trim()))
+            || self.is_encrypted_column(column)
+        {
+            return Err(AppError::UnprocessableEntity(
+                "Invalid filter Inputs".into(),
+            ));
+        }
+        let scope = self.scope(ctx)?;
+        let initial_filter = FilterExpr::empty();
+        let mut filter = hooks::run(self.inner.hooks.before_find.as_ref(), initial_filter, ctx)
+            .await?
+            .and_expr(&scope);
+        if let Some(extra) = extra_filter {
+            filter = filter.and_expr(extra);
+        }
+        filter = filter.and(column, Operator::IsNotNull, DbValue::Null);
+        let mut values = self
+            .db
+            .distinct_values(
+                self.table_name(),
+                column,
+                self.safe_delete(),
+                Some(&filter),
+                search,
+                limit,
+            )
+            .await?;
+        if let Some(col_rule) = self
+            .inner
+            .rules
+            .iter()
+            .find(|r| r.column.trim().eq_ignore_ascii_case(column.trim()))
+        {
+            for v in &mut values {
+                rules::normalize(col_rule, v);
+            }
+        }
+        Ok(values)
     }
 }
 

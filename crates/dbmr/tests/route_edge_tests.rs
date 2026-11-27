@@ -143,7 +143,7 @@ async fn database_error_in_precheck_is_500() {
 #[tokio::test]
 async fn unknown_method_on_item_is_405() {
     let app = app().await;
-    let (s, _) = call_raw(&app, "OPTIONS", "/1", "").await;
+    let (s, _) = call_raw(&app, "TRACE", "/1", "").await;
     assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
 }
 

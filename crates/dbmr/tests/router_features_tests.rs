@@ -121,6 +121,31 @@ async fn send(
     }
 }
 
+async fn send_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Res {
+    let mut b = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let req = b.body(Body::from(body.to_string())).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    Res {
+        status,
+        headers,
+        text: String::from_utf8(bytes.to_vec()).unwrap(),
+    }
+}
+
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> Res {
     send(app, method, uri, body, &[], None).await
 }
@@ -165,7 +190,7 @@ async fn read_only_router_answers_405_for_writes() {
     let r = call(&app, "GET", "/?output_content_type=csv", None).await;
     assert_eq!(r.status, StatusCode::OK);
     // Unknown methods share the same 405 body.
-    let r = call(&app, "OPTIONS", "/", None).await;
+    let r = call(&app, "TRACE", "/", None).await;
     assert_eq!(r.json(), danger("Method Not Allowed"));
 }
 
@@ -467,13 +492,19 @@ async fn openapi_document_follows_models_and_options() {
         m.sort();
         m
     };
-    assert_eq!(methods("/accounts"), ["delete", "get", "post", "put"]);
+    assert_eq!(
+        methods("/accounts"),
+        ["delete", "get", "options", "post", "put"]
+    );
     assert_eq!(
         methods("/accounts/{id}"),
-        ["delete", "get", "patch", "post", "put"]
+        ["delete", "get", "options", "patch", "post", "put"]
     );
-    assert_eq!(methods("/accounts/{account_id}/posts"), ["get"]);
-    assert_eq!(methods("/accounts/{account_id}/posts/{id}"), ["get"]);
+    assert_eq!(methods("/accounts/{account_id}/posts"), ["get", "options"]);
+    assert_eq!(
+        methods("/accounts/{account_id}/posts/{id}"),
+        ["get", "options"]
+    );
     let nested_params = paths["/accounts/{account_id}/posts/{id}"]["get"]["parameters"]
         .as_array()
         .unwrap();
@@ -793,4 +824,517 @@ async fn includes_and_foreign_keys_stay_inside_the_scope() {
         Value::Null,
         "B's user must not leak"
     );
+}
+
+#[tokio::test]
+async fn test_filters_route_cardinality_and_search() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            secret TEXT,
+            tenant_id TEXT
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let db = Arc::new(SqliteAdapter::new(pool));
+    let model = Model::builder(db.clone(), "items")
+        .column("id", "integer")
+        .column("title", "required|string")
+        .column("status", "required|string")
+        .column("secret", "string")
+        .column("tenant_id", "string")
+        .hidden(["secret"])
+        .build()
+        .unwrap();
+
+    let ctx = Context::system();
+    let seed = |v: Value| dbmr::core::types::json_to_row(&v);
+
+    // 1. Seed status with 3 distinct values (low cardinality / fixed enum)
+    // 2. Seed title with 110 distinct values (high cardinality / searchable > 50)
+    for i in 0..110 {
+        let status = match i % 3 {
+            0 => "draft",
+            1 => "published",
+            _ => "archived",
+        };
+        let title = format!("ItemTitle_{i:03}");
+        model
+            .insert(
+                seed(json!({
+                    "title": title,
+                    "status": status,
+                    "secret": format!("secret_{i}"),
+                    "tenant_id": "T1"
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap();
+    }
+
+    let app = Router::new().nest("/items", create_model_router(model.clone()));
+
+    // A. Full table discovery: DISCOVER /items
+    let r = send(&app, "DISCOVER", "/items", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["table"], "items");
+    let cols = j["columns"].as_array().unwrap();
+
+    // Verify secret (hidden) is NOT leaked
+    assert!(
+        cols.iter().all(|c| c["column"] != "secret"),
+        "hidden columns must never be exposed"
+    );
+
+    // Verify status: low cardinality (fixed)
+    let status_col = cols.iter().find(|c| c["column"] == "status").unwrap();
+    assert_eq!(status_col["filterable"], true);
+    assert_eq!(status_col["mode"], "fixed");
+    assert_eq!(status_col["cardinality"], 3);
+    let status_vals: Vec<_> = status_col["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(status_vals, vec!["archived", "draft", "published"]);
+
+    // Verify title: high cardinality (searchable > 50)
+    let title_col = cols.iter().find(|c| c["column"] == "title").unwrap();
+    assert_eq!(title_col["filterable"], true);
+    assert_eq!(title_col["mode"], "searchable");
+    assert_eq!(title_col["cardinality"], ">50");
+    assert_eq!(title_col["min_query_length"], 3);
+    assert!(
+        title_col["values"].as_array().unwrap().is_empty(),
+        "searchable values must be empty until searched"
+    );
+
+    // B. Search with < 3 letters: DISCOVER /items?column=title&q=it
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=it",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["column"], "title");
+    assert_eq!(j["mode"], "searchable");
+    assert_eq!(j["values"].as_array().unwrap().len(), 0);
+    assert_eq!(j["min_query_length"], 3);
+    assert!(
+        j["message"]
+            .as_str()
+            .unwrap()
+            .contains("Minimum 3 characters"),
+        "must prompt for 3 characters"
+    );
+
+    // C. Search with >= 3 letters: DISCOVER /items?column=title&q=ItemTitle_005
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=ItemTitle_005",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["column"], "title");
+    assert_eq!(j["mode"], "searchable");
+    let vals: Vec<_> = j["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(vals, vec!["ItemTitle_005"]);
+
+    // D. Query specific column via query param: DISCOVER /items?column=title&q=ItemTitle_010
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=ItemTitle_010",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["values"][0], "ItemTitle_010");
+
+    // Query specific fixed enum column: DISCOVER /items?column=status
+    let r = send(&app, "DISCOVER", "/items?column=status", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["mode"], "fixed");
+    assert_eq!(j["values"].as_array().unwrap().len(), 3);
+
+    // Static /filters and /_filters routes are removed so string IDs work cleanly
+    let r = send(&app, "GET", "/items/_filters", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = send(&app, "GET", "/items/filters", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    // =========================================================================
+    // Custom HTTP Method "DISCOVER" JSON Body & Edge Cases ("FILTER" is 405)
+    // =========================================================================
+
+    // 1. FILTER /items is not a supported method (405)
+    let r = send(&app, "FILTER", "/items", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // 2. DISCOVER /items with JSON body: DISCOVER /items {"column": "title", "query": "ItemTitle_005"}
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items",
+        Some(json!({ "column": "title", "query": "ItemTitle_005" })),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["column"], "title");
+    assert_eq!(j["values"][0], "ItemTitle_005");
+
+    // 3. DISCOVER /items with < 3 letters in JSON body
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items",
+        Some(json!({ "column": "title", "query": "00" })),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["values"].as_array().unwrap().len(), 0);
+    assert_eq!(j["min_query_length"], 3);
+
+    // 4. DISCOVER /items with fixed enum column in body: DISCOVER /items {"column": "status"}
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items",
+        Some(json!({ "column": "status" })),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["mode"], "fixed");
+    assert_eq!(j["values"].as_array().unwrap().len(), 3);
+
+    // 5. DISCOVER on item/path routes (e.g. /items/{column}) MUST NOT be implemented (405)
+    let r = send(&app, "DISCOVER", "/items/title", None, &[], None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "DISCOVER method on item paths must be disallowed"
+    );
+
+    // Item DISCOVER with malformed body MUST return 405 Method Not Allowed with Allow header
+    let r_malformed = send_raw(
+        &app,
+        "DISCOVER",
+        "/items/1",
+        "{malformed json",
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(r_malformed.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(r_malformed.headers.get("allow").is_some());
+
+    // E. Hidden column directly queried on collection must fail with 422
+    let r = send(&app, "DISCOVER", "/items?column=secret", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let r = send(
+        &app,
+        "DISCOVER",
+        "/items",
+        Some(json!({ "column": "secret" })),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // F. RouterOptions with filters disabled -> 405 Method Not Allowed
+    let opts = RouterOptions {
+        filters: false,
+        ..Default::default()
+    };
+    let disabled_app = Router::new().nest("/items", create_model_router_with(model.clone(), opts));
+    let r = send(&disabled_app, "DISCOVER", "/items", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // G. DISCOVER method on collection
+    let r = send(&app, "DISCOVER", "/items", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["table"], "items");
+    assert_eq!(j["columns"].as_array().unwrap().len(), 4);
+
+    let r = send(&app, "DISCOVER", "/items?column=status", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["mode"], "fixed");
+
+    // DISCOVER on item path is rejected with 405
+    let r = send(&app, "DISCOVER", "/items/1", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // H. OPTIONS method on collection and item
+    let r = send(&app, "OPTIONS", "/items", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let allow = r.headers.get("allow").unwrap().to_str().unwrap();
+    assert!(allow.contains("OPTIONS"));
+    assert!(allow.contains("GET"));
+    assert!(allow.contains("POST"));
+    assert!(allow.contains("DISCOVER"));
+    assert_eq!(r.json()["resource"], "collection");
+
+    let r = send(&app, "OPTIONS", "/items/1", None, &[], None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let allow_item = r.headers.get("allow").unwrap().to_str().unwrap();
+    assert!(allow_item.contains("OPTIONS"));
+    assert!(allow_item.contains("GET"));
+    assert!(allow_item.contains("PUT"));
+    assert!(allow_item.contains("PATCH"));
+    assert_eq!(r.json()["resource"], "item");
+
+    // I. In-memory cache: fixed columns (<=50 cardinality) are filtered directly from memory
+    let r1 = send(
+        &app,
+        "DISCOVER",
+        "/items?column=status&q=pub",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r1.status, StatusCode::OK);
+    let j1 = r1.json();
+    assert_eq!(j1["column"], "status");
+    assert_eq!(j1["values"][0], "published");
+    assert_eq!(j1["values"].as_array().unwrap().len(), 1);
+
+    // Searchable column with < 3 characters
+    let r_short = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=it",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_short.status, StatusCode::OK);
+    assert_eq!(r_short.json()["mode"], "searchable");
+    assert_eq!(r_short.json()["values"].as_array().unwrap().len(), 0);
+    assert_eq!(r_short.json()["min_query_length"], 3);
+
+    // Searchable column with >= 3 characters (fetches from DB)
+    let r_search = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=ItemTitle_001",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_search.status, StatusCode::OK);
+    assert_eq!(r_search.json()["mode"], "searchable");
+    assert_eq!(r_search.json()["values"].as_array().unwrap().len(), 1);
+
+    // Searchable column without query
+    let r_no_query = send(&app, "DISCOVER", "/items?column=title", None, &[], None).await;
+    assert_eq!(r_no_query.status, StatusCode::OK);
+    assert_eq!(r_no_query.json()["mode"], "searchable");
+    assert_eq!(r_no_query.json()["min_query_length"], 3);
+
+    // Unknown column returns 404 Not Found
+    let r_unknown = send(
+        &app,
+        "DISCOVER",
+        "/items?column=nonexistent",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_unknown.status, StatusCode::NOT_FOUND);
+
+    // Autocomplete literal term escaping: searching for "%" or "!" does not match everything
+    let r_lit = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=ItemTitle_%",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_lit.status, StatusCode::OK);
+    assert_eq!(r_lit.json()["values"].as_array().unwrap().len(), 0);
+
+    let r_bang = send(
+        &app,
+        "DISCOVER",
+        "/items?column=title&q=ItemTitle_!",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_bang.status, StatusCode::OK);
+    assert_eq!(r_bang.json()["values"].as_array().unwrap().len(), 0);
+
+    // Primary key discovery via query param and shorthand
+    let r_pk = send(&app, "DISCOVER", "/items?column=id", None, &[], None).await;
+    assert_eq!(r_pk.status, StatusCode::OK);
+    assert_eq!(r_pk.json()["column"], "id");
+    assert_eq!(r_pk.json()["mode"], "searchable");
+
+    // Regression: general ?search= must not treat '!' as an escape character
+    let search_model = Model::builder(db.clone(), "items")
+        .column("id", "integer")
+        .column("title", "required|string")
+        .column("status", "required|string")
+        .search_columns(["title"])
+        .build()
+        .unwrap();
+    search_model
+        .insert(seed(json!({"title": "foo!bar", "status": "draft"})), &ctx)
+        .await
+        .unwrap();
+    let search_app = Router::new().nest("/items", create_model_router(search_model));
+    let r_search_bang = send(&search_app, "GET", "/items?search=foo!bar", None, &[], None).await;
+    assert_eq!(r_search_bang.status, StatusCode::OK);
+    assert_eq!(r_search_bang.json()["count"], 1);
+    assert_eq!(r_search_bang.json()["data"][0]["title"], "foo!bar");
+
+    // Required scope enforcement: model with require_scope returns 401 when scope is absent
+    let scoped_model = Model::builder(db.clone(), "items")
+        .column("id", "integer")
+        .column("title", "string")
+        .column("tenant_id", "string")
+        .require_scope(["tenant_id"])
+        .build()
+        .unwrap();
+    let scoped_app = Router::new().nest("/scoped", create_model_router(scoped_model));
+    let r_scoped = send(&scoped_app, "DISCOVER", "/scoped", None, &[], None).await;
+    assert_eq!(r_scoped.status, StatusCode::UNAUTHORIZED);
+
+    // In-memory cache: prewarm and invalidate
+    let state = std::sync::Arc::new(dbmr::http::ModelRouterState::new(
+        std::sync::Arc::new(model.clone()),
+        RouterOptions::default(),
+    ));
+    state
+        .warm_discovery_cache(&Context::system())
+        .await
+        .unwrap();
+    {
+        let cache_guard = state.discovery_cache.read().await;
+        assert!(cache_guard.is_some());
+        let c = cache_guard.as_ref().unwrap();
+        assert_eq!(c.columns.len(), 4);
+    }
+    state.invalidate_discovery_cache().await;
+    {
+        let cache_guard = state.discovery_cache.read().await;
+        assert!(cache_guard.is_none());
+    }
+
+    // Hooked model enforcement: before_find filters discovery values
+    let hooked_model = Model::builder(db.clone(), "items")
+        .column("id", "integer")
+        .column("title", "string")
+        .column("status", "string")
+        .hooks(
+            dbmr::core::ModelHooks::new().before_find(|f, _| async move {
+                Ok(f.and("status", dbmr::core::Operator::Eq, "published"))
+            }),
+        )
+        .build()
+        .unwrap();
+    let hooked_app = Router::new().nest("/hooked", create_model_router(hooked_model));
+    let r_hooked = send(
+        &hooked_app,
+        "DISCOVER",
+        "/hooked?column=status",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_hooked.status, StatusCode::OK);
+    let j_hooked = r_hooked.json();
+    assert_eq!(
+        j_hooked["values"].as_array().unwrap(),
+        &vec![json!("published")]
+    );
+
+    // Encrypted column enforcement: excluded from filterable discovery
+    let enc_cfg = dbmr::core::EncryptionConfig::new(
+        "raw:YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+        1,
+        None,
+    )
+    .unwrap();
+    let enc_model = Model::builder(db.clone(), "items")
+        .column("id", "integer")
+        .column("secret", "encrypted|string")
+        .encryption(enc_cfg)
+        .build()
+        .unwrap();
+    let enc_app = Router::new().nest("/encrypted_items", create_model_router(enc_model));
+    // Direct DISCOVER targeting encrypted column -> 422
+    let r_enc = send(
+        &enc_app,
+        "DISCOVER",
+        "/encrypted_items?column=secret",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(r_enc.status, StatusCode::UNPROCESSABLE_ENTITY);
+    // In full table discovery, encrypted column is marked filterable: false
+    let r_enc_all = send(&enc_app, "DISCOVER", "/encrypted_items", None, &[], None).await;
+    assert_eq!(r_enc_all.status, StatusCode::OK);
+    let sec_col = r_enc_all.json()["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["column"] == "secret")
+        .unwrap()
+        .clone();
+    assert_eq!(sec_col["filterable"], false);
 }

@@ -45,6 +45,14 @@ Following crate consolidation, all library modules live in `crates/dbmr/src/`:
    - `create_model_router` MUST support both individual (`POST /resources` with `{...}`) and bulk (`POST /resources` with `{"data":[...]}`) writes.
    - The OpenAPI generator (`http/openapi.rs`) MUST document both the single-record and bulk-array request/response shapes via `oneOf`.
 
+7. **DISCOVER Route Convention & Scaffolding Safety**:
+   - Column filter discovery and autocomplete search use the custom HTTP method `DISCOVER` exclusively on the collection endpoint (`DISCOVER /:resource`).
+   - It MUST NEVER be mounted or accepted on item routes (`/:resource/{id}`) or column-specific paths (`/:resource/{column}`); `DISCOVER` requests on item paths must return `405 Method Not Allowed`. This prevents scaffolding clashes when child tables or nested resources share names with columns.
+   - Cardinality discovery probes up to 51 values: $\le 50$ distinct values return `mode: "fixed"` with the full enum list; $> 50$ returns `mode: "searchable"` requiring $\ge 3$ query characters.
+   - For models with $\le 100$ columns, discovery is pre-warmed on application start and served from an in-memory cache, eliminating repetitive database queries for fixed column lookups.
+   - Targeting hidden or encrypted columns returns `422 Unprocessable Entity`.
+   - `OPTIONS` requests on collection and item routes return `200 OK` with RFC 9110 `Allow` headers dynamically reflecting enabled `RouterOptions`.
+
 ---
 
 ## Minimal Reference Implementations
