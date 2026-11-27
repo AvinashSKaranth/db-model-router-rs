@@ -140,3 +140,224 @@ impl<T: Serialize + DeserializeOwned> TypedModel<T> {
         })
     }
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::adapters::SqliteAdapter;
+    use crate::core::adapter::DatabaseAdapter;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Item {
+        id: Option<i64>,
+        name: String,
+        val: Option<i64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Incompatible {
+        pub missing_bool: bool,
+    }
+
+    async fn setup_typed_model() -> (TypedModel<Item>, Context) {
+        let db = SqliteAdapter::connect("sqlite::memory:").await.unwrap();
+        db.query(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, val INTEGER)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let model = Model::builder(db, "items")
+            .column("id", "integer")
+            .column("name", "required|string")
+            .column("val", "integer|nullable")
+            .build()
+            .unwrap();
+
+        (model.typed::<Item>(), Context::new())
+    }
+
+    #[tokio::test]
+    async fn test_typed_model_full_lifecycle() {
+        let (tm, ctx) = setup_typed_model().await;
+
+        // Clone and model()
+        let tm_clone = tm.clone();
+        assert_eq!(tm_clone.model().table_name(), "items");
+
+        // insert
+        let ins = tm
+            .insert(
+                &Item {
+                    id: None,
+                    name: "item1".into(),
+                    val: Some(10),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .expect("inserted item");
+        assert_eq!(ins.id, Some(1));
+        assert_eq!(ins.name, "item1");
+        assert_eq!(ins.val, Some(10));
+
+        // insert_many
+        let summary = tm
+            .insert_many(
+                &[
+                    Item {
+                        id: None,
+                        name: "item2".into(),
+                        val: Some(20),
+                    },
+                    Item {
+                        id: None,
+                        name: "item3".into(),
+                        val: Some(30),
+                    },
+                ],
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.rows, 2);
+
+        // by_id
+        let item1 = tm.by_id(1, &ctx).await.unwrap().expect("by_id 1");
+        assert_eq!(item1.name, "item1");
+        assert!(tm.by_id(999, &ctx).await.unwrap().is_none());
+
+        // find
+        let page = tm.find(Query::new(), &ctx).await.unwrap();
+        assert_eq!(page.data.len(), 3);
+        assert_eq!(page.count, 3);
+        let _ = format!("{page:?}");
+        let _ = page.clone();
+
+        // find_one
+        let item2 = tm
+            .find_one(Query::new().eq("name", "item2"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(item2.unwrap().name, "item2");
+
+        let none_item = tm
+            .find_one(Query::new().eq("name", "nonexistent"), &ctx)
+            .await
+            .unwrap();
+        assert!(none_item.is_none());
+
+        // list
+        let list_page = tm.list(Query::new().limit(2), &ctx).await.unwrap();
+        assert_eq!(list_page.data.len(), 2);
+        assert_eq!(list_page.count, 3);
+
+        // update
+        let updated = tm
+            .update(
+                &Item {
+                    id: Some(1),
+                    name: "item1-upd".into(),
+                    val: Some(15),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.unwrap().name, "item1-upd");
+
+        // update_many
+        let upd_many = tm
+            .update_many(
+                &[
+                    Item {
+                        id: Some(2),
+                        name: "item2-upd".into(),
+                        val: Some(25),
+                    },
+                    Item {
+                        id: Some(3),
+                        name: "item3-upd".into(),
+                        val: Some(35),
+                    },
+                ],
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(upd_many.rows, 2);
+
+        // patch
+        let patched = tm
+            .patch(&serde_json::json!({ "id": 1, "val": 100 }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(patched.unwrap().val, Some(100));
+
+        // upsert
+        let upserted = tm
+            .upsert(
+                &Item {
+                    id: Some(1),
+                    name: "item1-upsert".into(),
+                    val: Some(111),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(upserted.unwrap().name, "item1-upsert");
+
+        // upsert_many
+        let upsert_many = tm
+            .upsert_many(
+                &[
+                    Item {
+                        id: Some(2),
+                        name: "item2-upsert".into(),
+                        val: Some(222),
+                    },
+                    Item {
+                        id: Some(4),
+                        name: "item4-new".into(),
+                        val: Some(444),
+                    },
+                ],
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(upsert_many.rows >= 2);
+
+        // to_row error
+        let err = tm.patch(&"not an object", &ctx).await.unwrap_err();
+        match err {
+            AppError::UnprocessableEntity(msg) => {
+                assert!(msg.contains("must serialize to a JSON object"));
+            }
+            other => panic!("expected UnprocessableEntity, got {other:?}"),
+        }
+
+        // from_row error with Incompatible type
+        let incomp = tm.model().typed::<Incompatible>();
+        let err2 = incomp.find(Query::new(), &ctx).await.unwrap_err();
+        match err2 {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("Cannot decode row into the typed record"));
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+
+        let err3 = incomp.list(Query::new(), &ctx).await.unwrap_err();
+        match err3 {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("Cannot decode row into the typed record"));
+            }
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+    }
+}

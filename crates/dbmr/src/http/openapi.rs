@@ -431,7 +431,37 @@ fn collection_ops(
             ),
         );
     }
+    let options_desc = if o.filters {
+        format!(
+            "Allowed methods for {name} collection (includes custom DISCOVER method for column cardinality discovery and autocomplete)"
+        )
+    } else {
+        format!("Allowed methods for {name} collection")
+    };
+    ops.insert(
+        "options".into(),
+        op(options_desc, &params, None, options_responses()),
+    );
     ops
+}
+
+fn options_responses() -> Value {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "resource": {"type": "string"},
+            "methods": {"type": "array", "items": {"type": "string"}}
+        }
+    });
+    json!({
+        "200": {
+            "description": "OK",
+            "headers": {
+                "Allow": {"schema": {"type": "string"}, "description": "Allowed HTTP methods"}
+            },
+            "content": {"application/json": {"schema": schema}}
+        }
+    })
 }
 
 fn item_ops(name: &str, m: &Model, o: &RouterOptions, params: Vec<Value>) -> Map<String, Value> {
@@ -507,5 +537,14 @@ fn item_ops(name: &str, m: &Model, o: &RouterOptions, params: Vec<Value>) -> Map
             ),
         );
     }
+    ops.insert(
+        "options".into(),
+        op(
+            format!("Allowed methods for {name} item"),
+            &params,
+            None,
+            options_responses(),
+        ),
+    );
     ops
 }

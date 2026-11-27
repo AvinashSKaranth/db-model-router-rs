@@ -364,6 +364,66 @@ pub fn compile_order_by(dialect: SqlDialect, sort: &[SortKey]) -> String {
     format!(" ORDER BY {}", parts.join(", "))
 }
 
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compile_distinct(
+    dialect: SqlDialect,
+    table: &str,
+    column: &str,
+    filter: &FilterExpr,
+    safe_delete: Option<&str>,
+    search: Option<&str>,
+    limit: usize,
+    types: Option<&HashMap<String, String>>,
+) -> (String, Vec<DbValue>) {
+    let tbl = dialect.quote_identifier(table);
+    let col = dialect.quote_identifier(column);
+    let mut where_comp = compile_where_typed(dialect, filter, safe_delete, 0, types);
+
+    if let Some(s) = search.filter(|s| !s.is_empty()) {
+        let escaped = s.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+        let (lhs, op, term) = match dialect {
+            SqlDialect::Postgres => (format!("CAST({col} AS TEXT)"), "ILIKE", escaped),
+            SqlDialect::Oracle => (format!("UPPER({col})"), "LIKE", escaped.to_uppercase()),
+            _ => (col.clone(), "LIKE", escaped),
+        };
+        let ph = format_placeholder(dialect, where_comp.params.len());
+        where_comp.params.push(DbValue::Text(format!("%{term}%")));
+        let sep = if where_comp.clause.is_empty() {
+            " WHERE "
+        } else {
+            " AND "
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut where_comp.clause,
+            format_args!("{sep}{lhs} {op} {ph} ESCAPE '!'"),
+        );
+    }
+
+    let sql = match dialect {
+        SqlDialect::Mssql => {
+            format!(
+                "SELECT DISTINCT TOP ({limit}) {col} AS val FROM {tbl}{} ORDER BY {col} ASC",
+                where_comp.clause
+            )
+        }
+        SqlDialect::Oracle => {
+            format!(
+                "SELECT DISTINCT {col} AS val FROM {tbl}{} ORDER BY {col} ASC FETCH FIRST {limit} ROWS ONLY",
+                where_comp.clause
+            )
+        }
+        SqlDialect::Sqlite | SqlDialect::Postgres | SqlDialect::Mysql => {
+            format!(
+                "SELECT DISTINCT {col} AS val FROM {tbl}{} ORDER BY {col} ASC LIMIT {limit}",
+                where_comp.clause
+            )
+        }
+    };
+
+    (sql, where_comp.params)
+}
+
 /// Node parity helper: replace '_' with ' ', capitalize each word boundary.
 #[must_use]
 pub fn namify(text: &str) -> String {

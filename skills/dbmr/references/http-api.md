@@ -15,6 +15,8 @@ use dbmr::http::{create_model_router_with, health_router, openapi, openapi_route
 | Method | `/` (collection) | `/{id}` (item) |
 |---|---|---|
 | GET | List `{data:[...], count}` | Record (+ `ETag` on versioned models), or 404 `{"message":"Not Found","type":"danger"}` |
+| OPTIONS | Allowed methods `{"resource":"collection","methods":[...]}` + `Allow` header | Allowed methods `{"resource":"item","methods":[...]}` + `Allow` header |
+| DISCOVER | Discover filterable columns & cardinality/enum values | 405 |
 | QUERY | List, params in JSON body | Same as GET |
 | POST | One object: single insert. `{"data":[...]}`: bulk insert | Single insert; path id ignored |
 | PUT | Bulk update/upsert `{"data":[...]}` (400 without) | Update row id (404 if not visible) |
@@ -24,13 +26,39 @@ use dbmr::http::{create_model_router_with, health_router, openapi, openapi_route
 Single writes return the stored record. Bulk returns `{"rows":n,"message":"...","type":"success"}`.
 Item routes refuse `{"data":[...]}` bodies on every method with 400
 `Bulk writes ({"data": [...]}) use the collection route`.
-Every 405 has the JSON body `{"message":"Method Not Allowed","type":"danger"}`.
+Every 405 has the JSON body `{"message":"Method Not Allowed","type":"danger"}` and an RFC 9110 `Allow` header.
+
+## DISCOVER Route (cardinality & in-memory enum discovery)
+
+The custom HTTP method `DISCOVER /` discovers filterable columns and distinct values:
+- **Discovery**: `DISCOVER /` returns all non-hidden, non-encrypted columns with `filterable: true`, type, and cardinality `mode`:
+  - `mode: "fixed"`: $\le 50$ distinct values; `values` contains the full enum list.
+  - `mode: "searchable"`: $> 50$ distinct values; values are queried on-demand.
+- **In-Memory Cache & Pre-Warming**:
+  - For models with $\le 100$ columns, discovery is automatically pre-warmed on application start and cached in memory.
+  - Full discovery (`DISCOVER /`) and low-cardinality column lookups (`DISCOVER /?column=status` or `?status=val`) are served directly from memory with zero database queries.
+- **Search**: `DISCOVER /?column=col&q=term` or body `{"column": "col", "query": "term"}`:
+  - For searchable columns, queries require at least 3 characters (`< 3` chars returns empty `values: []`).
+  - Returns `{"column": "col", "mode": "searchable", "values": [...]}` matching the search term.
+- Anchored exclusively on collection route (`/`). Attempting `DISCOVER /{id}` returns `405 Method Not Allowed`.
+- Hidden columns return `422 Unprocessable Entity`.
+- Can be disabled with `RouterOptions { filters: false, .. }` (returns 405).
+
+## OPTIONS Route
+
+Sending `OPTIONS` to either `/` or `/{id}` returns `200 OK` with an `Allow` header listing the permitted HTTP methods for that resource (reflecting enabled `RouterOptions`), and JSON body:
+```json
+{
+  "resource": "collection",
+  "methods": ["OPTIONS", "GET", "QUERY", "POST", "PUT", "DELETE", "DISCOVER"]
+}
+```
 
 ## RouterOptions
 
 Fields (all `bool`): `list`, `get`, `create` (`POST /` with one object, `POST /{id}`),
 `bulk_create` (`POST /` with `data`), `update` (`PUT /{id}`), `bulk_update` (`PUT /`), `patch`, `delete` (`DELETE /{id}`),
-`bulk_delete` (`DELETE /`), `export` (csv/xml). `QUERY` counts as `list`/`get`.
+`bulk_delete` (`DELETE /`), `export` (csv/xml), `filters` (`DISCOVER /`). `QUERY` counts as `list`/`get`.
 
 ```rust
 // Read-only resource: list, get, export. Writes → 405.

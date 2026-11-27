@@ -10,5 +10,7 @@ pub use formatter::{format_csv, format_xml};
 pub use health::health_router;
 pub use openapi::{openapi, openapi_route};
 pub use router::{
-    create_model_router, create_model_router_with, error_response, ModelRouterState, RouterOptions,
+    allowed_collection_methods, allowed_item_methods, create_model_router,
+    create_model_router_with, error_response, CachedColumn, DiscoveryCache, ModelRouterState,
+    RouterOptions, CARDINALITY_FIXED_LIMIT, CARDINALITY_PROBE_LIMIT, DEFAULT_PREWARM_COLUMNS_LIMIT,
 };

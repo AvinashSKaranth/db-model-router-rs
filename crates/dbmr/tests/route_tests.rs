@@ -52,6 +52,7 @@ async fn app() -> Router {
 struct Res {
     status: StatusCode,
     content_type: String,
+    allow: Option<String>,
     text: String,
 }
 
@@ -72,12 +73,17 @@ async fn call_with(app: &Router, mut req: Request<Body>, user: Option<Value>) ->
         .get(header::CONTENT_TYPE)
         .map(|v| v.to_str().unwrap().to_string())
         .unwrap_or_default();
+    let allow = res
+        .headers()
+        .get(header::ALLOW)
+        .map(|v| v.to_str().unwrap().to_string());
     let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
         .await
         .unwrap();
     Res {
         status,
         content_type,
+        allow,
         text: String::from_utf8(bytes.to_vec()).unwrap(),
     }
 }
@@ -469,10 +475,30 @@ async fn hostile_identifiers_cannot_inject() {
 #[tokio::test]
 async fn unknown_method_is_405() {
     let app = app().await;
-    assert_eq!(
-        call(&app, "OPTIONS", "/", None).await.status,
-        StatusCode::METHOD_NOT_ALLOWED
-    );
+    let r = call(&app, "TRACE", "/", None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(r.allow.is_some());
+}
+
+#[tokio::test]
+async fn options_method_on_collection_and_item() {
+    let app = app().await;
+    let r_coll = call(&app, "OPTIONS", "/", None).await;
+    assert_eq!(r_coll.status, StatusCode::OK);
+    let allow = r_coll.allow.as_deref().expect("allow header on collection");
+    assert!(allow.contains("OPTIONS"));
+    assert!(allow.contains("GET"));
+    assert!(allow.contains("POST"));
+    assert!(allow.contains("DISCOVER"));
+    assert_eq!(r_coll.json()["resource"], "collection");
+
+    let r_item = call(&app, "OPTIONS", "/1", None).await;
+    assert_eq!(r_item.status, StatusCode::OK);
+    let allow_item = r_item.allow.as_deref().expect("allow header on item");
+    assert!(allow_item.contains("OPTIONS"));
+    assert!(allow_item.contains("GET"));
+    assert!(allow_item.contains("PATCH"));
+    assert_eq!(r_item.json()["resource"], "item");
 }
 
 #[tokio::test]

@@ -73,11 +73,14 @@ Cargo: `dbmr = "0.0.1"` (or `dbmr = { version = "0.0.1", features = ["postgres"]
 | Route | Method | Mode | Request Payload | Response | Notes |
 |---|---|---|---|---|---|
 | `/:resource` | `GET` | Bulk | Query params (`?page=0&size=30`) | `{"data": [...], "count": total}` | Paged collection list |
+| `/:resource` | `OPTIONS` | Discovery | None | `{"resource": "collection", "methods": [...]}` | Allowed methods + `Allow` header |
+| `/:resource` | `DISCOVER` | Discovery | `?column=col&q=term` or `{"column":"col","query":"term"}` | `{"columns": [...]}` or `{"column": "col", "values": [...]}` | Discovers filterable columns & cardinality (fixed enum <=50, searchable >50 with >=3 chars). Pre-warmed & cached in-memory on start. Forbidden on item routes |
 | `/:resource` | `POST` | Individual | `{ "name": "Alice" }` | `{ "id": 1, "name": "Alice", ... }` | Single create returns record |
 | `/:resource` | `POST` | Bulk | `{"data": [{ "name": "Alice" }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk insert summary |
 | `/:resource` | `PUT` | Bulk | `{"data": [{ "id": 1, ... }, ...]}` | `{"rows": n, "message": "...", "type": "success"}` | Bulk update summary |
 | `/:resource` | `DELETE` | Bulk | Filter criteria object | `{"rows": n, "message": "...", "type": "success"}` | A matching filter is required |
 | `/:resource/:id` | `GET` | Individual | None | `{ "id": 1, ... }` | Exact literal PK equality |
+| `/:resource/:id` | `OPTIONS` | Discovery | None | `{"resource": "item", "methods": [...]}` | Allowed methods + `Allow` header |
 | `/:resource/:id` | `PUT` | Individual | `{ "name": "Alice Updated" }` | `{ "id": 1, ... }` | Replace record (preserves PK) |
 | `/:resource/:id` | `PATCH` | Individual | `{ "name": "Alice" }` | `{ "id": 1, ... }` | Partial update record |
 | `/:resource/:id` | `DELETE` | Individual | None | `{"rows": 1, "message": "...", "type": "success"}` | Deletes at most 1 row |
@@ -109,6 +112,7 @@ Cargo: `dbmr = "0.0.1"` (or `dbmr = { version = "0.0.1", features = ["postgres"]
 | 21 | Oracle: unquoted (upper-case) identifiers. Kafka: feature `kafka`, use `dbmr::kafka`. |
 | 22 | Declare every column with a type rule: values then read the same on every database (`"9"` → 9, booleans `true`/`false`, unset → `null`, keys in declared order). Declared `.unique([...])` keys are checked on insert everywhere: 409 `Duplicate value for unique key (..).` Upsert on a unique key also needs the DB `UNIQUE` constraint. |
 | 23 | Auth middleware: read headers via `let h = req.headers();`. A closure capturing `&req` across `.await` makes the future `!Send` and `from_fn` fails with a long `Service<Request>` error. |
+| 24 | Column discovery & autocomplete use custom HTTP method `DISCOVER /resources` (never on item routes `/{id}` or `/{col}` -> 405). Cardinality $\le 50 \to$ `mode: "fixed"` enum, $> 50 \to$ `mode: "searchable"` (requires $\ge 3$ search chars). Pre-warmed & cached in-memory on start ($\le 100$ columns). Hidden columns $\to$ 422. `OPTIONS` returns allowed methods + `Allow` header. |
 
 ## References (read the one you need)
 

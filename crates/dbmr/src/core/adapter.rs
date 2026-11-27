@@ -79,6 +79,71 @@ pub trait DatabaseAdapter: Send + Sync + 'static {
 
     fn escape_id(&self, name: &str) -> String;
 
+    /// Inspect distinct values of a column (for filter discovery and autocomplete).
+    async fn distinct_values(
+        &self,
+        table: &str,
+        column: &str,
+        safe_delete: Option<&str>,
+        filter: Option<&FilterExpr>,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DbValue>> {
+        let empty_filter = FilterExpr::empty();
+        let f = filter.unwrap_or(&empty_filter);
+        let needle = search.filter(|s| !s.is_empty()).map(str::to_lowercase);
+        let sort = [crate::core::types::SortKey {
+            column: column.into(),
+            direction: crate::core::types::SortDirection::Asc,
+        }];
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let batch_size: u64 = 100;
+        let mut offset: u64 = 0;
+        loop {
+            let res = self
+                .get(
+                    table,
+                    f,
+                    &sort,
+                    safe_delete,
+                    GetOptions {
+                        count: false,
+                        limit: Some(batch_size),
+                        offset: Some(offset),
+                    },
+                )
+                .await?;
+            if res.data.is_empty() {
+                break;
+            }
+            let count = res.data.len() as u64;
+            for row in res.data {
+                if let Some(val) = row.get(column) {
+                    if val.is_null() {
+                        continue;
+                    }
+                    if let Some(ref q) = needle {
+                        if !val.to_string().to_lowercase().contains(q) {
+                            continue;
+                        }
+                    }
+                    if seen.insert(val.to_json().to_string()) {
+                        out.push(val.clone());
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
+            offset += count;
+            if count < batch_size {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Start a transaction. SQLite, PostgreSQL/CockroachDB, MySQL/MariaDB and MSSQL implement this;
     /// every other adapter returns [`NO_TX_MESSAGE`].
     async fn begin_tx(&self) -> Result<Arc<dyn TransactionAdapter>> {
@@ -211,6 +276,20 @@ impl<T: DatabaseAdapter + ?Sized> DatabaseAdapter for Arc<T> {
 
     fn escape_id(&self, name: &str) -> String {
         (**self).escape_id(name)
+    }
+
+    async fn distinct_values(
+        &self,
+        table: &str,
+        column: &str,
+        safe_delete: Option<&str>,
+        filter: Option<&FilterExpr>,
+        search: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DbValue>> {
+        (**self)
+            .distinct_values(table, column, safe_delete, filter, search, limit)
+            .await
     }
 
     async fn begin_tx(&self) -> Result<Arc<dyn TransactionAdapter>> {
